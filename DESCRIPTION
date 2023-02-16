@@ -1,11 +1,10 @@
 Package: eoPred
 Type: Package
-Title: What the Package Does (Title Case)
+Title: Predict early preeclampsia using placental DNA methylation
 Version: 0.1.0
-Author: Who wrote it
-Maintainer: The package maintainer <yourself@somewhere.net>
-Description: More about what it does (maybe more than one line)
-    Use four spaces when indenting paragraphs within the Description.
+Author: Iciar Fernandez Boyano
+Maintainer: Iciar Fernandez Boyano <iciarfernandez@outlook.com>
+Description: eoPred relies on 45 CpG sites in the genome to predict early preeclampsia using      placental DNA methylation measured with an 450K/850K array.
 License: What license is it under?
 Encoding: UTF-8
 LazyData: true
