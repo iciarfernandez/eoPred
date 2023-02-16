@@ -8,6 +8,7 @@ Description: eoPred relies on 45 CpG sites in the genome to predict early preecl
 License: What license is it under?
 Encoding: UTF-8
 RoxygenNote: 7.2.3
+LazyData: false
 Depends: 
     R (>= 3.6.1)
 Imports: 
