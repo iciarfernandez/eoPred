@@ -1,0 +1,927 @@
+---
+title: "Developing a good model with as less probes as possible"
+author: "Icíar Fernández Boyano"
+date: "Originally written on June 24th, 2022 - Modified on October 27th, 2022"
+subtitle: "Last sanity check + knit on March 2023"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo 
+editor_options: 
+  chunk_output_type: console
+---
+
+# 1.0 Introduction
+
+I am curious to see how small I can make the model without sacrificing performance. I will build several iterations and apply it to the training data to see how the class probabilities and discrete classifications change. I think that reducing the number of features significantly will affect it, but at the same time I wonder whether we can get it to be small enough to run pyrosequencing for validation.
+
+```{r setup}
+
+library(tidyverse)
+library(mixOmics)
+library(here)
+library(tictoc)
+library(doParallel)
+library(impute)
+library(sva)
+library(missMethyl)
+library(janitor)
+library(factoextra)
+library(plomics)
+library(tidyr)
+library(ENmix)
+library(ggpubr)
+
+# PROBE INFO
+
+probeInfo <- cbind(IlluminaHumanMethylation450kanno.ilmn12.hg19::Locations,
+                   IlluminaHumanMethylation450kanno.ilmn12.hg19::Manifest,
+                      IlluminaHumanMethylation450kanno.ilmn12.hg19::Other) %>% as.data.frame()
+
+probeInfo <- rownames_to_column(probeInfo, var="probeID")
+
+chrXY <- probeInfo %>% filter(chr %in% c("chrX", "chrY"))
+chrX <- probeInfo %>% filter(chr %in% c("chrX"))
+chrY <- probeInfo %>% filter(chr %in% c("chrY"))
+
+# OBJECTS
+
+x_train <- readRDS(here("Data", "03_Predictor", "x_train.rds"))
+y_train <- readRDS(here("Data", "03_Predictor", "y_train.rds"))
+trainMeta <- read.csv(here("Data", "03_Predictor", "trainMeta.csv"))
+
+```
+
+# 2.0 Build models
+
+```{r build models}
+
+set.seed(2022)
+
+tic()
+mod.90 <- splsda(x_train,
+              y_train,
+              ncomp = 1,
+              keepX = 90)
+
+mod.75 <- splsda(x_train,
+              y_train,
+              ncomp = 1,
+              keepX = 75)
+
+mod.60 <- splsda(x_train,
+              y_train,
+              ncomp = 1,
+              keepX = 60)
+
+mod.45 <- splsda(x_train,
+              y_train,
+              ncomp = 1,
+              keepX = 45)
+
+mod.30 <- splsda(x_train,
+              y_train,
+              ncomp = 1,
+              keepX = 30)
+
+mod.15 <- splsda(x_train,
+              y_train,
+              ncomp = 1,
+              keepX = 15)
+
+mod.5 <- splsda(x_train,
+              y_train,
+              ncomp = 1,
+              keepX = 5)
+toc() 
+
+```
+
+# 3.0 Assess CV performance
+
+## 3.1 Set up CV
+
+```{r cv setup, warning=FALSE, message=FALSE}
+
+set.seed(2022)
+
+tic()
+perf.splsda.90 <- perf(mod.90,
+                       folds = 3,
+                       auc=TRUE,
+                       nrepeat = 50, # use repeated cross-validation
+                       validation = "Mfold",
+                       dist = "max.dist",  # use max.dist measure
+                       progressBar = FALSE)
+
+gc()
+
+perf.splsda.75 <- perf(mod.75,
+                       folds = 3,
+                       auc=TRUE,
+                       nrepeat = 50, # use repeated cross-validation
+                       validation = "Mfold",
+                       dist = "max.dist",  # use max.dist measure
+                       progressBar = FALSE)
+
+gc()
+
+perf.splsda.60 <- perf(mod.60,
+                       folds = 3,
+                       auc=TRUE,
+                       nrepeat = 50, # use repeated cross-validation
+                       validation = "Mfold",
+                       dist = "max.dist",  # use max.dist measure
+                       progressBar = FALSE)
+
+gc()
+
+perf.splsda.45 <- perf(mod.45,
+                       folds = 3,
+                       auc=TRUE,
+                       nrepeat = 50, # use repeated cross-validation
+                       validation = "Mfold",
+                       dist = "max.dist",  # use max.dist measure
+                       progressBar = FALSE)
+
+gc()
+
+perf.splsda.30 <- perf(mod.30,
+                       folds = 3,
+                       auc=TRUE,
+                       nrepeat = 50, # use repeated cross-validation
+                       validation = "Mfold",
+                       dist = "max.dist",  # use max.dist measure
+                       progressBar = FALSE)
+gc()
+
+perf.splsda.15 <- perf(mod.15,
+                       folds = 3,
+                       auc=TRUE,
+                       nrepeat = 50, # use repeated cross-validation
+                       validation = "Mfold",
+                       dist = "max.dist",  # use max.dist measure
+                       progressBar = FALSE)
+gc()
+
+perf.splsda.5 <- perf(mod.5,
+                       folds = 3,
+                      auc=TRUE,
+                       nrepeat = 50, # use repeated cross-validation
+                       validation = "Mfold",
+                       dist = "max.dist",  # use max.dist measure
+                       progressBar = TRUE)
+gc()
+
+
+toc() 
+
+gc()
+
+```
+
+## 3.2 Assess CV - Error Rates + Confusion Matrices
+
+```{r cv assess error rates}
+
+# ERROR RATES
+
+error_rate <- data.frame(Model = c("90 Probes", "75 Probes", "60 Probes", "45 Probes", "30 Probes", "15 Probes", "5 Probes"),
+                 ER = c(perf.splsda.90$error.rate$overall[1], 
+                        perf.splsda.75$error.rate$overall[1],
+                        perf.splsda.60$error.rate$overall[1],
+                        perf.splsda.45$error.rate$overall[1], 
+                        perf.splsda.30$error.rate$overall[1], 
+                        perf.splsda.15$error.rate$overall[1],
+                        perf.splsda.5$error.rate$overall[1]),
+                 ER_SD = c(perf.splsda.90$error.rate.sd$overall[1], 
+                           perf.splsda.75$error.rate.sd$overall[1],
+                           perf.splsda.60$error.rate.sd$overall[1],
+                           perf.splsda.45$error.rate.sd$overall[1], 
+                           perf.splsda.30$error.rate.sd$overall[1], 
+                           perf.splsda.15$error.rate.sd$overall[1],
+                           perf.splsda.5$error.rate$overall[1]),
+                 ER_EOPE = c(perf.splsda.90$error.rate.class$max.dist[1], 
+                             perf.splsda.75$error.rate.class$max.dist[1],
+                             perf.splsda.60$error.rate.class$max.dist[1],
+                             perf.splsda.45$error.rate.class$max.dist[1], 
+                             perf.splsda.30$error.rate.class$max.dist[1],
+                             perf.splsda.15$error.rate.class$max.dist[1],
+                             perf.splsda.5$error.rate.class$max.dist[1]),
+                 ER_nPTB = c(perf.splsda.90$error.rate.class$max.dist[2], 
+                             perf.splsda.75$error.rate.class$max.dist[2], 
+                             perf.splsda.60$error.rate.class$max.dist[2], 
+                             perf.splsda.45$error.rate.class$max.dist[2],
+                             perf.splsda.30$error.rate.class$max.dist[2],
+                             perf.splsda.15$error.rate.class$max.dist[2],
+                             perf.splsda.5$error.rate.class$max.dist[2]))
+
+write.csv(error_rate, here("Output", "2022_Manuscript", "03_MinimalModel", "00_ErrorRates.csv"))
+
+plot_error_rate <-
+error_rate %>%
+  pivot_longer(!c(Model, ER, ER_SD), names_to = "Class", values_to = "Error Rate") %>%
+  mutate(Class = case_when(Class == "ER_EOPE" ~ "EOPE",
+                           Class == "ER_nPTB" ~ "Non-PE Preterm")) %>%
+  mutate(paired = rep(1:(n()/2),each=2),
+         Class=factor(Class))
+
+ggplot(plot_error_rate, aes(x=factor(Model, level=c("90 Probes", "75 Probes", "60 Probes", "45 Probes", "30 Probes", "15 Probes", "5 Probes")), y=`Error Rate`))  +
+  geom_line(aes(group=paired))+
+  geom_point(aes(color=Class), size=4) +
+  scale_color_manual(values=c("#E69F00", "#999999")) +
+  coord_flip() +
+  ylim(c(0,0.20)) +
+  ylab("Mean Squared Error Rate") +
+  xlab("Model") +
+  theme_minimal() # not significant
+
+res_aov <- aov(`Error Rate` ~ Model, data=plot_error_rate)
+summary(res_aov) # confirmed
+
+ggsave(here::here("Output", "2022_Manuscript", "03_MinimalModel", "00_ErrorRates.png"),
+       width = 9,
+       height = 3)
+
+```
+
+```{r cv assess cm}
+
+getCP <- function(predict.output, metadata){
+  CP <- predict.output$predict[,,1]
+  CP <- t(apply(as.matrix(CP), 1, function(data) exp(data)/sum(exp(data))))
+  CP <- as.data.frame(CP) %>% rownames_to_column("Sample_ID")
+  CP$Pred_Class <- CP$comp1
+  CP$True_Class <- metadata$Condition
+  CP <- CP %>%
+  mutate(Pred_Class_Probs = case_when(EOPE > `Non-PE Preterm` ~ "EOPE",
+                                      EOPE < `Non-PE Preterm` ~ "Non-PE Preterm"))
+  CP
+}
+
+# average all predictions from each of the 50 CV folds
+getAvPred <- function(perf_object){
+  y <- perf_object$predict$comp1
+  z <- lapply(seq(dim(y)[3]), function(x) y[ , , x])
+  z <- do.call(cbind.data.frame, z)
+  nms <- unique(names(z))
+  z <- sapply(nms, function(x) rowMeans(z[names(z) %in% x]))
+  z <- t(apply(as.matrix(z), 1, function(data) exp(data)/sum(exp(data))))
+  z <- as.data.frame(z) %>% mutate(Sample_ID = rownames(z))
+  z <- z %>% mutate(PredClass = case_when(EOPE > `Non-PE Preterm` ~ "EOPE",
+                                          EOPE < `Non-PE Preterm` ~ "Non-PE Preterm"))
+  metadata <- trainMeta %>% dplyr::select(Sample_ID, Class)
+  mz <- left_join(metadata, z, by="Sample_ID")
+  mz <- mz %>% mutate(True = case_when(Class == "Non-PE Preterm" ~ 0,
+                                       Class == "EOPE" ~ 1))
+}
+
+list <- list(mod90 = perf.splsda.90,
+             mod75 = perf.splsda.75,
+             mod60 = perf.splsda.60,
+             mod45 = perf.splsda.45,
+             mod30 = perf.splsda.30,
+             mod15 = perf.splsda.15,
+             mod5 = perf.splsda.5)
+
+avpreds <- lapply(list, getAvPred)
+
+length(cm <- lapply(avpreds, 
+                    function(x) caret::confusionMatrix(data=as.factor(x$Class),
+                                                       reference=as.factor(x$PredClass)))) # 7 - one per model
+
+# print out all of them so that I can go back if  needed when knitting the script
+cm$mod90 # makes sense!
+cm$mod75
+cm$mod60
+cm$mod45
+cm$mod30
+cm$mod15
+cm$mod5
+
+### sensitivity
+sens <- lapply(cm, 
+               function(x) x$byClass['Sensitivity']) %>% as.data.frame()
+
+sens <- t(sens)
+
+### specificity
+spec <- lapply(cm, 
+               function(x) x$byClass['Specificity']) %>% as.data.frame()
+
+spec <- t(spec)
+
+### precision
+prec <- lapply(cm, 
+               function(x) x$byClass['Precision']) %>% as.data.frame()
+
+prec <- t(prec)
+
+### recall
+recall <- lapply(cm, 
+                 function(x) x$byClass['Recall']) %>% as.data.frame()
+
+recall <- t(recall)
+
+### F1
+f1 <- lapply(cm, 
+                 function(x) x$byClass['F1']) %>% as.data.frame()
+
+f1 <- t(f1)
+
+### PPV
+ppv <- lapply(cm, 
+                 function(x) x$byClass['Pos Pred Value']) %>% as.data.frame()
+
+ppv <- t(ppv)
+
+allMetrics <- do.call("cbind", list(sens, spec, prec, recall, f1, ppv))
+head(allMetrics)
+
+```
+
+## 3.3 Assess CV - Feature Stability
+
+```{r cv assess feature stability}
+
+# FEATURE STABILITY
+
+# mod 1 - 90
+preds.90 <- selectVar(mod.90)$name
+stab.90 <- as.data.frame(perf.splsda.90$features$stable$comp1[preds.90])
+
+plot_stab <- function(data, model_name){
+  ggplot(data) +
+  geom_bar(aes(x = Var1, y = Freq), stat = "identity", fill = "#D5B895") +
+  xlab("Features") +
+  ylab("Stability") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0,1), expand = c(0, 0)) +
+  ggtitle(paste0("Stability of ", model_name, " on Cross-Validation"))
+}
+
+plot_stab(stab.90, "90 CpG probe model")
+
+ggsave(here::here("Output", "2022_Manuscript", "03_MinimalModel", "01_1_FeatureStability_90.png"),
+       width = 10,
+       height = 4)
+
+# mod 2 - 75
+preds.75 <- selectVar(mod.75)$name
+stab.75 <- as.data.frame(perf.splsda.75$features$stable$comp1[preds.75])
+
+plot_stab(stab.75, "75 CpG probe model")
+
+ggsave(here::here("Output", "2022_Manuscript", "03_MinimalModel", "01_2_FeatureStability_75.png"),
+       width = 10,
+       height = 4)
+
+# mod 3 - 60
+preds.60 <- selectVar(mod.60)$name
+stab.60 <- as.data.frame(perf.splsda.60$features$stable$comp1[preds.60])
+
+plot_stab(stab.60, "60 CpG probe model")
+
+ggsave(here::here("Output", "2022_Manuscript", "03_MinimalModel", "01_3_FeatureStability_60.png"),
+       width = 10,
+       height = 4)
+
+# mod 4 - 45
+preds.45 <- selectVar(mod.45)$name
+stab.45 <- as.data.frame(perf.splsda.45$features$stable$comp1[preds.45])
+
+plot_stab(stab.45, "45 CpG probe model")
+
+ggsave(here::here("Output", "2022_Manuscript", "03_MinimalModel", "01_4_FeatureStability_45.png"),
+       width = 10,
+       height = 4)
+
+# mod 5 - 30
+preds.30 <- selectVar(mod.30)$name
+stab.30 <- as.data.frame(perf.splsda.30$features$stable$comp1[preds.30])
+
+plot_stab(stab.30, "30 CpG probe model")
+
+ggsave(here::here("Output", "2022_Manuscript", "03_MinimalModel", "01_5_FeatureStability_30.png"),
+       width = 10,
+       height = 4)
+
+# mod 5 - 15
+preds.15 <- selectVar(mod.30)$name
+stab.15 <- as.data.frame(perf.splsda.15$features$stable$comp1[preds.15])
+
+plot_stab(stab.15, "15 CpG probe model")
+
+ggsave(here::here("Output", "2022_Manuscript", "03_MinimalModel", "01_6_FeatureStability_15.png"),
+       width = 10,
+       height = 4)
+
+# mod 5 - 5
+preds.5 <- selectVar(mod.5)$name
+stab.5 <- as.data.frame(perf.splsda.5$features$stable$comp1[preds.5])
+
+plot_stab(stab.5, "5 CpG probe model")
+
+ggsave(here::here("Output", "2022_Manuscript", "03_MinimalModel", "01_7_FeatureStability_5.png"),
+       width = 10,
+       height = 4)
+
+
+### in numbers
+get_pred_info <- function(predictor_names, perf_object, model_object){
+  probe_info <- probeInfo %>% filter(probeID %in% predictor_names) %>% dplyr::select(probeID, chr, UCSC_RefGene_Name, UCSC_RefGene_Group, pos)
+  # then extract the stability values from perf
+  stability <- as.data.frame(perf_object$features$stable$comp1[probe_info$probeID])
+  stability$probeID <- stability$Var1
+  stability$Var1 <- NULL
+  # merge with predictor info
+  probe_info <- merge(probe_info, stability, by = "probeID")
+  # add loading values
+  loadings <- as.data.frame(selectVar(model_object,comp =1)$value)
+  loadings$probeID <- rownames(loadings)
+  rownames(loadings) <- NULL
+  # join with predictor info
+  probe_info <- merge(probe_info, loadings, by = "probeID")
+  # tidy
+  probe_info$Loading_Val <- probe_info$value.var
+  probe_info$value.var <- NULL
+  probe_info$Freq_Stability <- probe_info$Freq
+  probe_info$Freq <- NULL
+  probe_info <- dplyr::select(probe_info, c(probeID, Freq_Stability, Loading_Val, chr, UCSC_RefGene_Name, UCSC_RefGene_Group, pos))
+  probe_info <- arrange(probe_info, desc(Freq_Stability))
+  probe_info
+}
+
+## mod 1 - 90 ##
+preds.90 <- get_pred_info(preds.90, perf.splsda.90, mod.90)
+print(preds.90)
+write.csv(preds.90, here::here("Output", "2022_Manuscript", "03_MinimalModel", "02_1_Predictors_90.csv"))
+
+## mod 2 - 75 ##
+preds.75 <- get_pred_info(preds.75, perf.splsda.75, mod.75)
+print(preds.75)
+write.csv(preds.75, here::here("Output", "2022_Manuscript", "03_MinimalModel", "02_2_Predictors_75.csv"))
+
+## mod 3 - 60 ##
+preds.60 <- get_pred_info(preds.60, perf.splsda.60, mod.60)
+print(preds.60)
+write.csv(preds.60, here::here("Output", "2022_Manuscript", "03_MinimalModel", "02_3_Predictors_60.csv"))
+
+## mod 4 - 45 ##
+preds.45 <- get_pred_info(preds.45, perf.splsda.45, mod.45)
+print(preds.45)
+write.csv(preds.45, here::here("Output", "2022_Manuscript", "03_MinimalModel", "02_4_Predictors_45.csv"))
+
+## mod 5 - 30 ##
+preds.30 <- get_pred_info(preds.30, perf.splsda.30, mod.30)
+print(preds.30)
+write.csv(preds.30, here::here("Output", "2022_Manuscript", "03_MinimalModel", "02_5_Predictors_30.csv"))
+
+## mod 6 - 15 ##
+preds.15 <- get_pred_info(preds.15, perf.splsda.15, mod.15)
+print(preds.15)
+write.csv(preds.15, here::here("Output", "2022_Manuscript", "03_MinimalModel", "02_6_Predictors_15.csv"))
+
+## mod 7 - 5 ##
+preds.5 <- get_pred_info(preds.5, perf.splsda.5, mod.5)
+print(preds.5)
+write.csv(preds.5, here::here("Output", "2022_Manuscript", "03_MinimalModel", "02_7_Predictors_5.csv"))
+
+```
+
+I had assumed that if say, the top 5 probes of the 45 probe model were selected 100% of the time in cross-validation (great stability), if I built a model on 5 probes (without specifically selecting which ones), these would be the top 5 probes of the 45 probe model. I now realize that in the 5 probe model, only 2 probes have ~0.65 stability, and the other 3 are ~0.25, so I think that may not be the case.
+
+## 3.4 Assess CV - ROC/AUC, Precision-Recall, and Lift Curves
+
+```{r cv assess continued}
+
+# AUC
+# https://cran.rstudio.com/web/packages/ROCR/vignettes/ROCR.html
+
+auc <- data.frame(Model = c("90 Probes", "75 Probes", "60 Probes", "45 Probes", "30 Probes", "15 Probes", "5 Probes"),
+                 AUC = c(perf.splsda.90$auc$comp1[[1]], 
+                        perf.splsda.75$auc$comp1[[1]],
+                        perf.splsda.60$auc$comp1[[1]],
+                        perf.splsda.45$auc$comp1[[1]], 
+                        perf.splsda.30$auc$comp1[[1]], 
+                        perf.splsda.15$auc$comp1[[1]],
+                        perf.splsda.5$auc$comp1[[1]]))
+
+head(auc)
+
+write.csv(auc, here::here("Output", "2022_Manuscript", "03_MinimalModel", "03_AUC.csv"))
+
+library(ROCR)
+library(ggsci)
+library(MLmetrics)
+
+preds <- cbind(mod90 = avpreds$mod90$EOPE,
+               mod75 = avpreds$mod75$EOPE,
+               mod60 = avpreds$mod60$EOPE,
+               mod45 = avpreds$mod45$EOPE,
+               mod30 = avpreds$mod30$EOPE,
+               mod15 = avpreds$mod15$EOPE,
+               mod5 = avpreds$mod5$EOPE)
+
+auc_mlmetrics <- sapply(as.data.frame(preds), function(x) MLmetrics::Area_Under_Curve(x, avpreds$mod90$True))
+print(auc_mlmetrics)
+
+pred.mat <- prediction(preds, 
+                       labels = matrix(avpreds$mod90$True, # all are the same 
+                                       nrow = length(avpreds$mod90$True), ncol = 7))
+
+perf.mat <- performance(pred.mat, "tpr", "fpr")
+
+df <- data.frame(Curve=as.factor(rep(c(1,2,3,4,5,6,7), each=length(perf.mat@x.values[[1]]))), 
+                 FalsePositive=c(perf.mat@x.values[[1]],
+                                 perf.mat@x.values[[2]],
+                                 perf.mat@x.values[[3]],
+                                 perf.mat@x.values[[4]],
+                                 perf.mat@x.values[[5]],
+                                 perf.mat@x.values[[6]],
+                                 perf.mat@x.values[[7]]),
+                 TruePositive=c(perf.mat@y.values[[1]],
+                                perf.mat@y.values[[2]],
+                                perf.mat@y.values[[3]],
+                                perf.mat@y.values[[4]],
+                                perf.mat@y.values[[5]],
+                                perf.mat@y.values[[6]],
+                                perf.mat@y.values[[7]]))
+
+
+ggplot() + 
+  geom_line(data=as.data.frame(df %>% filter(Curve==1)),
+            aes(x=FalsePositive, y=TruePositive, color=Curve), size=1.5, alpha=0.4)+
+  geom_line(data=as.data.frame(df %>% filter(Curve==2)), 
+            aes(x=FalsePositive, y=TruePositive, color=Curve), size=1.5, alpha=0.4) +
+  geom_line(data=as.data.frame(df %>% filter(Curve==3)), 
+            aes(x=FalsePositive, y=TruePositive, color=Curve), size=1.5, alpha=0.4) +
+  geom_line(data=as.data.frame(df %>% filter(Curve==4)), 
+            aes(x=FalsePositive, y=TruePositive, color=Curve), size=1.5, alpha=0.4) +
+  geom_line(data=as.data.frame(df %>% filter(Curve==5)), 
+            aes(x=FalsePositive, y=TruePositive, color=Curve), size=1.5, alpha=0.4) +
+  geom_line(data=as.data.frame(df %>% filter(Curve==6)), 
+            aes(x=FalsePositive, y=TruePositive, color=Curve), size=1.5, alpha=0.4) +
+  geom_line(data=as.data.frame(df %>% filter(Curve==7)), 
+            aes(x=FalsePositive, y=TruePositive, color=Curve), size=1.5, alpha=0.4) +
+  scale_colour_npg(labels=c("90 CpG probes", 
+                               "75 CpG probes", 
+                               "60 CpG probes",
+                               "45 CpG probes", 
+                               "30 CpG probes", 
+                               "15 CpG probes", 
+                               "5 CpG probes")) +
+  xlab("Average false positive rate") +
+  ylab("Average true positive rate") +
+  labs(col="Model") +
+  theme_minimal() +
+  labs(title= "Receiver Operating Characteristic Curve",
+       subtitle="Average ROC for repeated (n=50) 3-fold CV for each model")
+
+ggsave(here::here("Output", "2022_Manuscript", "03_MinimalModel",
+                  "03_ROC_Curves.png"),
+       width = 5,
+       height = 4)
+
+# PRECISION-RECALL
+
+avpreds <- lapply(avpreds, function(x) dplyr::mutate(x, Pred = case_when(PredClass == "Non-PE Preterm" ~ 0,
+                                                                         PredClass == "EOPE" ~ 1)))
+
+discrete_preds <- cbind(mod90 = avpreds$mod90$Pred,
+                        mod75 = avpreds$mod75$Pred,
+                        mod60 = avpreds$mod60$Pred,
+                        mod45 = avpreds$mod45$Pred,
+                        mod30 = avpreds$mod30$Pred,
+                        mod15 = avpreds$mod15$Pred,
+                        mod5 = avpreds$mod5$Pred)
+
+precision <- sapply(as.data.frame(discrete_preds), function(x) MLmetrics::Precision(x, avpreds$mod90$True))
+recall <- sapply(as.data.frame(discrete_preds), function(x) MLmetrics::Recall(x, avpreds$mod90$True))
+f1 <- sapply(as.data.frame(discrete_preds), function(x) MLmetrics::F1_Score(x, avpreds$mod90$True))
+sens <- sapply(as.data.frame(discrete_preds), function(x) MLmetrics::Sensitivity(x, avpreds$mod90$True))
+spec <- sapply(as.data.frame(discrete_preds), function(x) MLmetrics::Specificity(x, avpreds$mod90$True))
+
+print(precision)
+print(recall)
+print(f1)
+print(sens)
+print(spec)
+
+perf.mat <- performance(pred.mat, "prec", "rec")
+
+df <- data.frame(Curve=as.factor(rep(c(1,2,3,4,5,6,7), each=length(perf.mat@x.values[[1]]))), 
+                 Precision=c(perf.mat@x.values[[1]],
+                                 perf.mat@x.values[[2]],
+                                 perf.mat@x.values[[3]],
+                                 perf.mat@x.values[[4]],
+                                 perf.mat@x.values[[5]],
+                                 perf.mat@x.values[[6]],
+                                 perf.mat@x.values[[7]]),
+                 Recall=c(perf.mat@y.values[[1]],
+                                perf.mat@y.values[[2]],
+                                perf.mat@y.values[[3]],
+                                perf.mat@y.values[[4]],
+                                perf.mat@y.values[[5]],
+                                perf.mat@y.values[[6]],
+                                perf.mat@y.values[[7]]))
+
+ggplot() + 
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==1)),
+            aes(x=Recall, y=Precision, color=Curve), size=1, alpha=0.4, se=F)+
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==2)), 
+            aes(x=Recall, y=Precision, color=Curve), size=1, alpha=0.4, se=F) +
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==3)), 
+            aes(x=Recall, y=Precision, color=Curve), size=1, alpha=0.4, se=F) +
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==4)), 
+            aes(x=Recall, y=Precision, color=Curve), size=1, alpha=0.4, se=F) +
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==5)), 
+            aes(x=Recall, y=Precision, color=Curve), size=1, alpha=0.4, se=F) +
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==6)), 
+            aes(x=Recall, y=Precision, color=Curve), size=1, alpha=0.4, se=F) +
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==7)), 
+            aes(x=Recall, y=Precision, color=Curve), size=1, alpha=0.4, se=F) +
+  scale_colour_npg(labels=c("90 CpG probes", 
+                               "75 CpG probes", 
+                               "60 CpG probes",
+                               "45 CpG probes", 
+                               "30 CpG probes", 
+                               "15 CpG probes", 
+                               "5 CpG probes")) +
+  xlab("Average recall") +
+  ylab("Average precision") +
+  labs(col="Model") +
+  theme_minimal() +
+  labs(title= "Precision-Recall Curve",
+       subtitle="Average PR for repeated (n=50) 3-fold CV for each model")
+
+ggsave(here::here("Output", "2022_Manuscript", "03_MinimalModel",
+                  "03_PrecisionRecall_Curve.png"),
+       width = 5,
+       height = 4)
+
+# LIFT-RPP
+
+lift_auc <- sapply(as.data.frame(preds), function(x) MLmetrics::LiftAUC(x, avpreds$mod90$True))
+print(lift_auc)
+
+log_loss <- sapply(as.data.frame(preds), function(x) MLmetrics::Poisson_LogLoss(x, avpreds$mod90$True))
+print(log_loss)
+
+perf.mat <- performance(pred.mat, "lift", "rpp")
+
+df <- data.frame(Curve=as.factor(rep(c(1,2,3,4,5,6,7), each=length(perf.mat@x.values[[1]]))), 
+                 Lift=c(perf.mat@x.values[[1]],
+                                 perf.mat@x.values[[2]],
+                                 perf.mat@x.values[[3]],
+                                 perf.mat@x.values[[4]],
+                                 perf.mat@x.values[[5]],
+                                 perf.mat@x.values[[6]],
+                                 perf.mat@x.values[[7]]),
+                 RPP=c(perf.mat@y.values[[1]],
+                                perf.mat@y.values[[2]],
+                                perf.mat@y.values[[3]],
+                                perf.mat@y.values[[4]],
+                                perf.mat@y.values[[5]],
+                                perf.mat@y.values[[6]],
+                                perf.mat@y.values[[7]]))
+
+ggplot() + 
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==1)),
+            aes(x=RPP, y=Lift, color=Curve), size=1, alpha=0.4, se=F)+
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==2)), 
+            aes(x=RPP, y=Lift, color=Curve), size=1, alpha=0.4, se=F) +
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==3)), 
+            aes(x=RPP, y=Lift, color=Curve), size=1, alpha=0.4, se=F) +
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==4)), 
+            aes(x=RPP, y=Lift, color=Curve), size=1, alpha=0.4, se=F) +
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==5)), 
+            aes(x=RPP, y=Lift, color=Curve), size=1, alpha=0.4, se=F) +
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==6)), 
+            aes(x=RPP, y=Lift, color=Curve), size=1, alpha=0.4, se=F) +
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==7)), 
+            aes(x=RPP, y=Lift, color=Curve), size=1, alpha=0.4, se=F) +
+  scale_colour_npg(labels=c("90 CpG probes", 
+                               "75 CpG probes", 
+                               "60 CpG probes",
+                               "45 CpG probes", 
+                               "30 CpG probes", 
+                               "15 CpG probes", 
+                               "5 CpG probes")) +
+  xlab("Average rate of positive predictions") +
+  ylab("Average lift value") +
+  labs(col="Model") +
+  theme_minimal() +
+  labs(title= "Lift Chart",
+       subtitle="Average for repeated (n=50) 3-fold CV for each model")
+
+ggsave(here::here("Output", "2022_Manuscript", "03_MinimalModel",
+                  "03_Lift_Curve.png"),
+       width = 5,
+       height = 4)
+
+```
+
+## 3.5 Assess CV - Brier Score
+
+```{r}
+
+library(DescTools)
+
+brier <- data.frame(Model = c("90 Probes", "75 Probes", "60 Probes", "45 Probes", "30 Probes", "15 Probes", "5 Probes"),
+                 BrierScore = c(BrierScore(as.numeric(pred.mat@labels[[1]]), pred.mat@predictions[[1]]), 
+                        BrierScore(as.numeric(pred.mat@labels[[1]]), pred.mat@predictions[[2]]),
+                        BrierScore(as.numeric(pred.mat@labels[[1]]), pred.mat@predictions[[3]]),
+                        BrierScore(as.numeric(pred.mat@labels[[1]]), pred.mat@predictions[[4]]), 
+                        BrierScore(as.numeric(pred.mat@labels[[1]]), pred.mat@predictions[[5]]), 
+                        BrierScore(as.numeric(pred.mat@labels[[1]]), pred.mat@predictions[[6]]),
+                        BrierScore(as.numeric(pred.mat@labels[[1]]), pred.mat@predictions[[7]])))
+
+print(brier)
+
+write.csv(brier, here::here("Output", "2022_Manuscript", "03_MinimalModel", "04_BrierScores.csv"))
+
+```
+
+# 4.0 PCA
+
+```{r}
+
+train <- t(x_train)
+dim(train) # 341281 by 83
+
+dim(train.90 <- train[rownames(train) %in% selectVar(mod.45)$name,]) # 90 by 83
+
+all(colnames(train.90) == trainMeta$Sample_ID) # TRUE
+
+pca <- prcomp(t(na.omit(train.90)), center=TRUE)
+pca_summary <- summary(pca)
+
+loadings <- pca$x
+dim(loadings) # 83 by 83
+rownames(loadings) <- rownames(trainMeta)
+head(loadings) # individual PCs
+
+fviz_eig(pca, geom = "bar", bar_width = 0.5, # you'll need to install the package factoextra for this
+              addlabels = TRUE, hjust = -0.3,
+              barfill = "#BF98A0", barcolor = "#BF98A0") + 
+  ggtitle("PCA Variances of Training Data (On 45 Predictive Probes)") +
+  theme_minimal() +
+  labs(x = "Principal Components", y = "% of explained variances")
+
+ggsave(here::here("Output", "2022_Manuscript", "03_MinimalModel", "05_PCA45_Variances.png"),
+       width = 10,
+       height = 4)
+
+# rename columns
+pca_scores <- pca$x %>% as_tibble() %>% mutate(Sample_Name = trainMeta$Sample_ID) 
+
+# r squared
+pca_cor_rs <- lmmatrix(dep = pca_scores[,1:10],
+                        ind = as.data.frame(trainMeta) %>% 
+                          dplyr::select(GEO_Dataset,
+                                        Sex, 
+                                        PE,
+                                        Class,
+                                        GA_RPC,
+                                        Predicted_ethnicity_nothresh),
+                       metric = 'Rsquared')
+
+pca_plot_rs <- pca_cor_rs %>% as.data.frame() %>% 
+  # add indep variables from previous data 
+  mutate(indep = rownames(pca_cor_rs)) %>%
+  # reshape
+ pivot_longer(c(-indep), names_to = "PC", values_to = "rsqr" ) %>%
+  # pvalue categories
+  mutate(
+  # makes PC encoded with levels in the proper order , at this point PC is a character format and will not be properly coerced to a level 
+  PC = factor(PC, levels = colnames(pca_cor_rs))) %>% as_tibble()
+
+# Plot PCA 
+p1_r <- ggplot(pca_plot_rs, aes(x = PC, y = indep, fill = rsqr)) +
+  geom_tile(col = 'lightgrey') + theme_classic() +
+  scale_x_discrete(expand = c(0, 0), labels = 1:20) +
+  scale_y_discrete(expand = c(0, 0)) +
+  labs(y = '', fill = 'R Squared') +
+  scale_fill_gradientn(colors = c("#ff4d00", "#f98010", "#f09623", "#e9b448")) +
+  ggtitle("PCA - Training Data (On 45 Predictive Probes)") # try adding a title to this plot and saving it to your laptop with the code we already saw above! for the title, try googling 'add title to ggplot2'
+
+p1_r
+
+ggsave(here::here("Output", "2022_Manuscript", "03_MinimalModel", "03_PCA45_RSquared.png"),
+       width = 7,
+       height = 5)
+
+
+## notes:
+
+as.data.frame(pca_cor_rs) %>%
+  filter(PC1 > 0.5) # PE and Class
+
+
+# p value
+pca_cor_pval <- lmmatrix(dep = pca_scores[,1:10],
+                        ind = as.data.frame(trainMeta) %>% 
+                          dplyr::select(GEO_Dataset,
+                                        Sex, 
+                                        PE,
+                                        Class,
+                                        GA_RPC,
+                                        Predicted_ethnicity_nothresh),
+                       metric = 'Pvalue')
+
+pca_plot_pval <- pca_cor_pval %>% as.data.frame() %>% 
+  # add indep variables from previous data 
+  mutate(indep = rownames(pca_cor_pval)) %>%
+  # reshape
+ pivot_longer(c(-indep), names_to = "PC", values_to = "pval" ) %>%
+  # pvalue categories
+  mutate(
+  # makes PC encoded with levels in the proper order , at this point PC is a character format and will not be properly coerced to a level 
+  PC = factor(PC, levels = colnames(pca_cor_pval))) %>% as_tibble()
+
+# Plot PCA 
+p1_r <- ggplot(pca_plot_pval, aes(x = PC, y = indep, fill = pval)) +
+  geom_tile(col = 'lightgrey') + theme_classic() +
+  scale_x_discrete(expand = c(0, 0), labels = 1:20) +
+  scale_y_discrete(expand = c(0, 0)) +
+  labs(y = '', fill = 'P Value') +
+  scale_fill_gradientn(colors = c("#0047AB", "#6495ED", "#ADD8E6")) +
+  ggtitle("PCA - Training Data (On 45 Predictive Probes)") # change the colors here to different shades of blue so that you can distinguish this from the r square plot! also try adding the title and saving this plot, as above!
+
+p1_r # also strongly associated to Dataset, Sex, Ethnicity, but not so much class
+
+ggsave(here::here("Output", "2022_Manuscript", "03_MinimalModel", "03_PCA45_PValue.png"),
+       width = 7,
+       height = 5)
+
+as.data.frame(pca_cor_pval) %>%
+  filter(PC1 < 0.05) # PE, Class, and GA
+
+## create palettes
+datasets_pal <- c("#F5DEC1", "#FFC675", "#9BBF7D", "#7BA1A9",
+                  "#125D8E", "#333333")
+sex_pal <- c("#8B94FD", "#F9DC6F") # first female, then male
+condition_pal <- c("#F5DEC1", "#FFC675", "#9BBF7D", "#7BA1A9",
+                  "#125D8E", "#333333")
+bi_pal <- c("#ea5e51", "#f5debc")
+
+
+# by Class
+ggplot(data = as.data.frame(loadings), mapping = aes(x = PC1, y = PC2, colour = trainMeta$Class)) +
+  geom_point() + 
+  labs(x = paste0('PC1 (', pca_summary$importance[2,1]*100, '%)'),
+       y = paste0('PC2 (', pca_summary$importance[2,2]*100, '%)'),
+       colour = 'Class') +
+  scale_color_manual(values = c(bi_pal),
+                     labels = c("EOPE", "Non-PE Preterm")) + 
+  theme_minimal() +
+  theme(legend.position = "right") +
+  ggtitle(label = "Principal Component Analysis",
+          subtitle = "On 45 Predictive Probes")
+
+ggsave(here::here("Output", "2022_Manuscript", "03_MinimalModel", "03_PCA45_Scatter_Class.png"),
+       width = 7,
+       height = 5)
+
+# by ethnicity
+ggplot(data = as.data.frame(loadings), mapping = aes(x = PC1, y = PC2, colour = trainMeta$Predicted_ethnicity_nothresh)) +
+  geom_point() + 
+  labs(x = paste0('PC1 (', pca_summary$importance[2,1]*100, '%)'),
+       y = paste0('PC2 (', pca_summary$importance[2,2]*100, '%)'),
+       colour = 'Ethnicity') + 
+  theme_minimal() +
+  theme(legend.position = "right") +
+  ggtitle(label = "Principal Component Analysis",
+          subtitle = "On 45 Predictive Probes")
+
+
+# by dataset
+ggplot(data = as.data.frame(loadings), mapping = aes(x = PC1, y = PC2, colour = trainMeta$GEO_Dataset)) +
+  geom_point() + 
+  labs(x = paste0('PC1 (', pca_summary$importance[2,1]*100, '%)'),
+       y = paste0('PC2 (', pca_summary$importance[2,2]*100, '%)'),
+       colour = 'Dataset') + 
+  theme_minimal() +
+  theme(legend.position = "right") +
+  ggtitle(label = "Principal Component Analysis",
+          subtitle = "On 90 Predictive Probes")
+
+ggsave(here::here("Output", "2022_Manuscript", "03_MinimalModel", "03_PCA45_Scatter_Dataset.png"),
+       width = 7,
+       height = 5)
+
+# clear environment
+rm(pca)
+rm(pca_cor_pval)
+rm(pca_cor_rs)
+rm(pca_plot_pval)
+rm(pca_plot_rs)
+rm(pca_scores)
+rm(pca_summary)
+gc()
+
+```

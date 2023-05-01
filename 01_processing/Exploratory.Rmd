@@ -1,0 +1,849 @@
+---
+title: "Processing of Exploratory Cohort"
+author: "Icíar Fernández Boyano"
+date: "October 26th, 2022"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo 
+editor_options: 
+  chunk_output_type: console
+---
+
+# 1.0 Setup
+
+In this script, I will be processing the data from the exploratory cohort. While both validation and exploratory cohorts will be used to validate the model, they are processed separately because some leftover samples from the datasets that were included in the training data are in the exploratory cohort, and processing any data from a dataset included in the training (even if they are not the same samples per se) together with an independent cohort may introduce a bias in the data.
+
+```{r}
+
+# PACKAGES
+
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(minfi))
+suppressPackageStartupMessages(library(here))
+suppressPackageStartupMessages(library(janitor))
+suppressPackageStartupMessages(library(tictoc))
+suppressPackageStartupMessages(library(wateRmelon))
+suppressPackageStartupMessages(library(ewastools))
+suppressPackageStartupMessages(library(plomics))
+suppressPackageStartupMessages(library(GEOquery))
+suppressPackageStartupMessages(library(readxl))
+suppressPackageStartupMessages(library(IlluminaHumanMethylation450kanno.ilmn12.hg19))
+suppressPackageStartupMessages(library(IlluminaHumanMethylation450kmanifest))
+
+
+# OBJECTS
+
+here::here() # "Z:/Icíar/Projects/Aim1_PredictPE"
+
+
+# METHYL SET
+mset <- readRDS(here::here("Data", "01_Raw", "complete_mset.rds")) # created in 00_DownloadData.Rmd and 00_MergeGSE120981.Rmd, which are in Code/01_Preprocessing/2020_InitialPreprocessing
+NIHdata <- readRDS("Z:/Amy/Project_NIH_Epiphenotyping/02_Output/00_NIH_Parsing_RedCapSampleSheet/mset_raw.rds")
+NIHmetadata <- read.csv("Z:/Amy/Project_NIH_Epiphenotyping/02_Output/00_NIH_Parsing_RedCapSampleSheet/nih_redcap_204.csv")
+
+TOMeta <- NIHmetadata %>% filter(str_detect(Record.ID, 'TO'))
+dim(TOMeta) # 64
+
+TOMeta <- TOMeta %>% dplyr::select(Record.ID, 
+                                     Fetal.Sex, Pre.eclampsia,
+                                     IUGR, Gestational.age.at.delivery..weeks.,
+                                     Predicted_ethnicity_nothresh,
+                                     Prob_Asian, Prob_African, Prob_Caucasian, Sentrix,
+                                   Syncytiotrophoblast, Trophoblasts, Stromal, Hofbauer, Endothelial, nRBC) %>% mutate(GEO_Dataset = "GSE203396") %>% mutate(Sample_ID = Record.ID)
+
+dim(TO <- NIHdata[,colnames(NIHdata) %in% c(TOMeta$Sentrix)]) # 64, good
+all(colnames(TO) == TOMeta$Sentrix) # FALSE
+all(colnames(TO) %in% TOMeta$Sentrix) # TRUE
+TOMeta <- TOMeta %>% arrange(factor(Sentrix, levels=colnames(TO)))
+all(colnames(TO) == TOMeta$Sentrix) # TRUE
+colnames(TO) <- TOMeta$Sample_ID
+all(colnames(TO) == TOMeta$Sample_ID) # TRUE
+
+dim(mset) # 485512 by 401
+dim(pData(mset)) # 401 by 22
+
+pDat <- as.data.frame(pData(mset))
+  
+all(colnames(mset) == pDat$Sample_ID) # TRUE
+
+
+# DETECTION P-VALUE
+detp <- readRDS(here("Data", "01_Raw", "detp.rds"))
+
+
+# SNPs
+snp <- readRDS(here::here("Data", "01_Raw", "snps.rds")) # snps of all datasets
+dim(snp) # 65 by 419
+pDat %>% filter(!Sample_ID %in% colnames(snp)) # yeah, so GSE120981 is not here either
+# figured out that GSE120981 does not have SNP data either unfortunately, and from my previous notes I can see that GSE103253 doesn't either!
+any(is.na(snp)) # TRUE
+
+snp <- snp[,colnames(snp) %in% pDat$Sample_ID] 
+dim(snp) # 65 by 379
+pDat_onlysnp <- pDat %>% filter(!GEO_Dataset %in% c("GSE120981", "GSE103253"))
+dim(pDat_onlysnp) # 297
+
+snp <- snp[,colnames(snp) %in% pDat_onlysnp$Sample_ID] # subset to only those datasets that have SNP data, no point in keeping NAs
+dim(snp) # 65 by 297
+dim(pDat_onlysnp) # 297
+all(colnames(snp) == pDat_onlysnp$Sample_ID) # FALSE
+any(is.na(snp)) # FALSE - all are NAs, good
+
+snp <- snp[,pDat_onlysnp$Sample_ID] # order
+all(colnames(snp) == pDat_onlysnp$Sample_ID) # TRUE
+snps_datasets <- pDat %>%
+  dplyr::filter(Sample_ID %in% colnames(snp))
+table(snps_datasets$GEO_Dataset) 
+
+
+# BEADCOUNT
+bc <- readRDS(here::here("Data", "01_Raw", "beadcount.rds"))
+
+
+# PROBE INFO
+probeInfo <- cbind(IlluminaHumanMethylation450kanno.ilmn12.hg19::Locations,
+                   IlluminaHumanMethylation450kanno.ilmn12.hg19::Manifest,
+                      IlluminaHumanMethylation450kanno.ilmn12.hg19::Other) %>% as.data.frame()
+
+probeInfo <- rownames_to_column(probeInfo, var="probeID")
+
+chrXY <- probeInfo %>% filter(chr %in% c("chrX", "chrY"))
+chrX <- probeInfo %>% filter(chr %in% c("chrX"))
+chrY <- probeInfo %>% filter(chr %in% c("chrY"))
+
+zhouAnno <- readRDS("Z:/Amy/Data/Probe Info (Illumina Manifests)/Zhou/HM450.hg19.manifest.rds") %>% as.data.frame
+
+```
+
+## 1.1 Read in CPM16 and T16 samples
+
+I did not consider testing the predictor on these samples until later on in the project, so I read them in here and added them to the exploratory group in my latest iteration of the project - that's why they are not downloaded in the "00" set of scripts in this same folder. 
+
+```{r select data of interest}
+
+# read in master sample sheet
+master_ss <- read_xlsx('Z:/ROBLAB6 InfiniumSequenom/Master_Sample_Sheet.xlsx')
+
+# filter rows to samples of interest
+colnames(master_ss)
+levels(factor(master_ss$Tissue))
+levels(factor(master_ss$Condition))
+
+# cpm16
+CPM16 <- master_ss %>% 
+  filter(Condition == "CPM16")
+
+dim(CPM16) # 10
+levels(factor(CPM16$Tissue)) # all villi
+levels(factor(CPM16$Platform)) # all 450K
+CPM16$GSE_accession # GSE49343, which is the dataset I was looking to download
+
+# t16
+T16 <- master_ss %>%
+  filter(Condition == "T16")
+
+dim(T16) # 5
+levels(factor(T16$Tissue)) # all villi
+levels(factor(T16$Platform)) # all 450K
+T16$GSE_accession # also GSE49343
+
+# how many in GSE49343
+GSE49343 <- master_ss %>%
+  filter(GSE_accession == "GSE49343")
+dim(GSE49343)
+
+table(GSE49343$Condition) # okay, so that is all of them
+
+```
+
+```{r read in data of interest}
+
+dim(CPM16) # 10
+dim(T16) # 5
+
+samples_ss <- bind_rows(CPM16, T16)
+
+rgset <- read.metharray.exp(targets = DataFrame(samples_ss))
+
+dim(rgset) # 622399 by 15
+
+colnames(rgset) <- samples_ss$GSM_accession
+
+mset_16 <- preprocessRaw(rgset)
+
+```
+
+```{r download metadata from geo}
+
+# likely easiest for those samples
+# download.file('https://ftp.ncbi.nlm.nih.gov/geo/series/GSE49nnn/GSE49343/matrix/GSE49343_series_matrix.txt.gz', 
+#              destfile = here("Data/01_Raw/GSE49343_series_matrix.txt.gz"))
+# gunzip(here("Data/01_Raw/GSE49343_series_matrix.txt.gz"))
+
+GSE49343_pDat <- read.table(here("Data/01_Raw/GSE49343_series_matrix.txt"),
+                            sep = '\t',
+                            skip = 30, 
+                            nrow = 11,  
+                            header = T) %>% as.matrix()
+
+#gsub can modify elements of string vectors - removes all '!Sample' in all rows
+rownames(GSE49343_pDat) <- gsub('!Sample_', '', GSE49343_pDat[,1]) 
+
+# transpose so variables are in columns
+GSE49343_pDat <- GSE49343_pDat[,2:ncol(GSE49343_pDat)] %>% t() 
+
+# grep returns a vector of the indices of the elements of x (in this case, GSE100197_pDat) that yielded a match)
+ind <- grep('characteristics_ch1', colnames(GSE49343_pDat)) 
+
+# numbers the characteristics columns, i.e. before all were "characteristics_ch1", now "characteristics_ch1_1", "characteristics_ch1_2" etc
+colnames(GSE49343_pDat)[ind] <- paste0(colnames(GSE49343_pDat)[ind], '_', 1:length(ind)) 
+
+# rename columns + clean up variables
+GSE49343_pDat <- GSE49343_pDat %>% as_tibble() %>%
+  dplyr::select(geo_accession, contains('characteristics')) %>%
+  dplyr::rename(Sample_ID = geo_accession,
+                GA = characteristics_ch1_1,
+                Sex = characteristics_ch1_2,
+                Condition = characteristics_ch1_3) %>%
+  mutate(GA = gsub('^.*: ', '', GA),
+         Sex = gsub('^.*: ', '', Sex),
+         Condition = gsub('^.*: ', '', Condition)) %>%
+  dplyr::select(c(Sample_ID, GA, Sex, Condition))
+
+# save metadata
+write.table(GSE49343_pDat, here::here("Data", "01_Raw", "GSE49343_pDat.csv"), sep = "\t")
+          
+```
+
+# 2.0 Metadata
+
+```{r}
+
+# TRAIN
+trainMeta <- pDat %>% 
+  filter(GEO_Dataset %in% c("GSE100197", "GSE103253", "GSE57767", "GSE73375")) %>%
+  filter(!Condition == "Replicate") %>%
+  filter(!Condition == "IUGR") %>%
+  mutate(Class = case_when(Condition == "EOPE" ~ "EOPE",
+                           Condition == "PE" & GA_RPC < 34 ~ "EOPE",
+                           Condition == "Non-PE Preterm" ~ "Non-PE Preterm",
+                           PE == "No" & GA_RPC < 37 ~ "Non-PE Preterm")) %>%
+  mutate(Class = replace_na(Class, "Other")) %>%
+  filter(!Class == "Other")
+
+# TEST
+valMeta <- read.csv(here("Data", "02_Processed", "valMeta.csv"))
+
+# EXTERNAL
+extMeta <- pDat %>%
+  filter(!Sample_ID %in% c(trainMeta$Sample_ID, valMeta$Sample_ID)) %>%
+  filter(!Condition == "Replicate") %>%
+  mutate(Class = case_when(Condition == "EOPE" ~ "EOPE",
+                           Condition == "LOPE" ~ "LatePE",
+                           Condition == "IUGR" ~ "FGR",
+                           Condition == "Non-PE Preterm" & IUGR == "Yes" ~ "FGR",
+                           Condition == "Non-PE Preterm" ~ "Non-PE Preterm",
+                           Condition == "Non-PE Term" ~ "Non-PE Term",
+                           Condition == "PE" & GA_RPC > 34 ~ "LatePE",
+                           Condition == "PE" & GA_RPC < 34 ~ "EOPE"))
+
+dim(extMeta) # 260 by 23
+
+dim(TOMeta) # 64
+dim(TOMeta <- TOMeta %>% filter(!Sample_ID %in% c(valMeta$Sample_ID)) %>%
+      mutate(Class = "Non-PE Preterm",
+                  GA = Gestational.age.at.delivery..weeks.,
+                  Sex = Fetal.Sex,
+                  Sample_ID = Record.ID) %>% 
+      dplyr::select(!c(Record.ID, Fetal.Sex, Pre.eclampsia, Gestational.age.at.delivery..weeks., Sentrix))) # 59
+dim(TO <- TO[,colnames(TO) %in% TOMeta$Sample_ID]) # 59
+all(colnames(TO) == TOMeta$Sample_ID) # TRUE
+
+ext <- mset[,colnames(mset) %in% extMeta$Sample_ID]
+dim(ext) # 485512 by 260
+
+all(colnames(ext) == extMeta$Sample_ID) # TRUE
+
+tabyl(extMeta, Class)
+tabyl(extMeta, Class, GEO_Dataset)
+
+```
+
+## 2.1 Join in CPM16 and TO samples
+
+In this section, I join the metadata + data from the 10 CPM16 samples that I am interested in from GSE49343 and the term TO sampleswith the rest of the exploratory group. 
+
+```{r}
+
+### METADATA ###
+
+# first have a look at things
+GSE49343_pDat
+dim(mset_16) # 485512 by 15
+dim(GSE49343_pDat) # 30 by 4
+
+# subset the metadata to the samples that are in the mset
+GSE49343_pDat <-
+  GSE49343_pDat %>% filter(Sample_ID %in% c(colnames(mset_16)))
+
+all(colnames(mset_16) == GSE49343_pDat$Sample_ID) # FALSE - need to order
+
+GSE49343_pDat <- GSE49343_pDat[match(colnames(mset_16), GSE49343_pDat$Sample_ID),]
+
+all(colnames(mset_16) == GSE49343_pDat$Sample_ID) # TRUE
+
+# actually, just subset to CPM 16s
+GSE49343_pDat <- GSE49343_pDat %>% filter(Condition == "confined placental mosaicism")
+dim(mset_16 <- mset_16[,colnames(mset_16) %in% GSE49343_pDat$Sample_ID]) # 10
+all(colnames(mset_16) == GSE49343_pDat$Sample_ID) # TRUE
+
+colnames(GSE49343_pDat)
+colnames(extMeta)
+
+# harmonize a few things
+
+# sex
+GSE49343_pDat$Sex <- as.factor(GSE49343_pDat$Sex)
+levels(extMeta$Sex)
+levels(GSE49343_pDat$Sex) # F, M, N/A
+levels(GSE49343_pDat$Sex) <- c("Female", "Male", "Unknown")
+
+# condition
+GSE49343_pDat$Condition <- as.factor(GSE49343_pDat$Condition)
+levels(GSE49343_pDat$Condition) # cpm, t16
+levels(GSE49343_pDat$Condition) <- "CPM16"
+
+# GA
+class(GSE49343_pDat$GA) # character
+GSE49343_pDat$GA # issues is that 2 samples have unsure GAs because they are very early 3rd trimester
+GSE49343_pDat$GA <- as.numeric(GSE49343_pDat$GA)
+
+# dataset
+GSE49343_pDat$GEO_Dataset <- "GSE49343"
+
+# ethnicity
+set.seed(2022)
+tictoc::tic()
+mset_16BMIQ <- wateRmelon::BMIQ(mset_16)
+tictoc::toc() 
+
+library(planet)
+ethnicity <- planet::predictEthnicity(mset_16BMIQ)
+GSE49343_pDat <- full_join(GSE49343_pDat, ethnicity)
+
+# join
+extMeta <- full_join(extMeta, GSE49343_pDat)
+dim(extMeta) # 270 by 24, makes sense
+
+extMeta <- full_join(extMeta, TOMeta)
+dim(extMeta) # 329, makes sense 
+
+extMeta$GEO_Dataset
+
+extMeta <- extMeta %>%
+  mutate(Class = case_when(Condition == "EOPE" ~ "EOPE",
+                           Condition == "LOPE" ~ "LatePE",
+                           Condition == "IUGR" ~ "FGR",
+                           Condition == "Non-PE Preterm" & IUGR == "Yes" ~ "FGR",
+                           GEO_Dataset == "GSE203396" & GA > 37 ~ "Non-PE Term", # TO samples, the 5 preterms were already in the validation group
+                           Condition == "Non-PE Preterm" ~ "Non-PE Preterm",
+                           Condition == "Non-PE Term" ~ "Non-PE Term",
+                           Condition == "PE" & GA_RPC > 34 ~ "LatePE",
+                           Condition == "PE" & GA_RPC < 34 ~ "EOPE",
+                           Condition == "CPM16" ~ "CPM16"))
+
+tabyl(extMeta, Class)
+
+
+
+### DATA ###
+
+# subset CPM16 and T16 mset to cpgs in common between EPIC and HM450K
+dim(ext <- combineArrays(ext, mset_16,
+                         outType = c("IlluminaHumanMethylation450k"),
+                         verbose = TRUE)) # 485,512 by 270
+dim(ext <- combineArrays(ext, TO,
+                         outType = c("IlluminaHumanMethylation450k"),
+                         verbose = TRUE)) # 452,453 by 329
+
+```
+
+At this stage, I will save the raw data & metadata so that I can read it into Code/2022_GitHub/02_Code/00_Exploratory.Rmd, which is the simplified GitHub version of this script, where I avoid all the code where I assemble the cohort. 
+
+```{r}
+
+dim(ext) # 452453 by 329
+dim(extMeta) # 329 by 29
+
+all(colnames(ext) == extMeta$Sample_ID) # TRUE
+
+saveRDS(ext, here("Data", "01_Raw", "extRAW.rds"))
+write.csv(extMeta, here("Data", "01_Raw", "extMetaRAW.csv"))
+
+```
+
+# 3.0 Normalize
+
+```{r}
+
+set.seed(2022)
+tic()
+extBMIQ <- wateRmelon::BMIQ(ext)
+toc()
+
+saveRDS(extBMIQ, here("Data", "02_Processed", "extBMIQ.rds"))
+
+```
+
+# 4.0 Sample filtering
+
+## 3.1 Intersample correlation
+
+```{r}
+
+all(colnames(extBMIQ) == extMeta$Sample_ID) # TRUE
+
+cor <- cor(na.omit(extBMIQ))
+sample_cor <- apply(cor, 1, mean)
+sample_cor <- data.frame(mean_sample_cor = sample_cor, 
+                         Sample_ID = as.factor(names(sample_cor)))
+head(sample_cor)
+
+all(sample_cor$Sample_ID == extMeta$Sample_ID) # TRUE
+
+extMeta$meanSScor <- sample_cor$mean_sample_cor
+
+ggplot(extMeta, aes(x = Sample_ID, y = meanSScor)) +
+  geom_point(alpha=0.8) +
+  geom_label(data = extMeta %>% filter(meanSScor < 0.95), 
+             aes(label = Sample_ID), vjust = 1.5, col = 'grey') +
+  
+  scale_color_manual(values=c("#117733", "#CC6677")) +
+  scale_y_continuous(limits = c(0.9, 1), breaks = seq(0.9, 1, 0.01)) +
+  
+  theme_classic() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        plot.title = element_text(hjust=0.5)) +
+  labs(x = 'Sample', y = 'Mean correlation', col = 'Platform') +
+  geom_hline(yintercept = 0.95, linetype = 'dashed', color = 'grey') +
+  geom_hline(yintercept = 0.96, linetype = 'dashed', color = 'grey') +
+  geom_hline(yintercept = 0.97, linetype = 'dashed', color = 'grey') +
+  ggtitle("Mean Intersample Correlation - Normalized only")
+
+# drop the samples with <95% intersample correlation
+extMeta %>%
+  filter(meanSScor < 0.95) # 3 samples
+
+extMeta <- 
+  extMeta %>%
+  mutate(FAIL_Intersample_Cor = ifelse(meanSScor < 0.95, TRUE, FALSE))
+
+```
+
+## 3.2 Check sex
+
+Amy wrote the following code to adapt the `ewastools` check sex functions so that they can be used with an mset rather than using the `read_idats` from `ewastools`. For this check, I exclude the one sample in GSE49343 that did not have a reported sex (unknown).
+
+```{r functions}
+
+mset_check_sex = function(mset){
+  
+  if(!"tidyverse" %in% installed.packages()) {
+    install.packages("tidyverse")
+  }
+  
+  
+  if(!"BiocManager" %in% installed.packages()) {
+    install.packages("BiocManager")
+  }
+  
+  if(!"minfi" %in% installed.packages()) {
+    BiocManager::install("minfi")
+  }
+  
+  require(tidyverse)
+  require(minfi)
+  
+  # define M, U, and probe anno objects
+  M = minfi::getMeth(mset) %>% as.data.frame()
+  U = minfi::getUnmeth(mset) %>% as.data.frame()
+  anno = minfi::getAnnotation(mset) %>% as.data.frame() # annotation with "chr" column, entries chr1 - chrY, probeIDs as rownames
+	
+  
+  # select allosomal probes
+  chrX = dimnames(anno[anno$chr=='chrX',])[[1]]
+  chrY = dimnames(anno[anno$chr=='chrY',])[[1]]
+  
+  # compute the total intensities
+  chrX = colMeans(M[chrX,,drop=FALSE]+U[chrX,,drop=FALSE],na.rm=TRUE)
+  chrY = colMeans(M[chrY,,drop=FALSE]+U[chrY,,drop=FALSE],na.rm=TRUE)
+  
+  # compute the average total intensity across all autosomal probes
+  autosomes = dimnames(anno[!anno$chr %in% c("chrX","chrY"),])[[1]]
+  autosomes = colMeans(M[autosomes,,drop=FALSE]+U[autosomes,,drop=FALSE],na.rm=TRUE)
+  
+  # normalize total intensities
+  chrX_nonorm = chrX
+  chrY_nonorm = chrY
+  
+  chrX = chrX/autosomes
+  chrY = chrY/autosomes
+  
+  # define a df with the output
+  xy_int = data.frame(Sample_ID = dimnames(mset)[[2]],
+                      Array = annotation(mset)[[1]],
+                      X = chrX,
+                      Y = chrY,
+                      X_nonorm = chrX_nonorm,
+                      Y_nonorm = chrY_nonorm)
+  
+	return((xy_int))
+}
+
+mset_predict_sex = function(sex_int,male,female){
+
+	# compute the robust Hodges-Lehmann estimator for the total intensity for X chr probes
+	cutX = outer(sex_int$X[male],sex_int$X[female],"+")
+	cutX = median(cutX)/2
+
+	# ... likewise for Y chr probes
+	cutY = outer(sex_int$Y[male],sex_int$Y[female],"+")
+	cutY = median(cutY)/2
+
+	# Prediction based on in which quadrant (cutX/cutY) samples fall
+	DNAme_Sex = rep(NA,times=length(sex_int$X))
+	DNAme_Sex[sex_int$X>=cutX & sex_int$Y<=cutY] =  "XX"
+	DNAme_Sex[sex_int$X<=cutX & sex_int$Y>=cutY] =  "XY"
+	factor(DNAme_Sex,levels=c("XY","XX"),labels=c("XY","XX"))
+	
+	sex_preds = cbind(sex_int, DNAme_Sex)
+	
+	results = list("Sex_Preds" = sex_preds, "cutX" = cutX, "cutY" = cutY) 
+	
+	return(results)
+}
+
+```
+
+```{r check sex}
+
+dim(ext) # 329
+
+pred_sex <- mset_check_sex(ext)
+
+male <- extMeta$Sex == "Male"
+female <- extMeta$Sex == "Female"
+
+pred_sex <- mset_predict_sex(pred_sex, male, female)
+pred_sex_df <- pred_sex$Sex_Preds
+
+extMeta <- extMeta %>% left_join(pred_sex_df %>% dplyr::select(Sample_ID, X, Y, DNAme_Sex), by="Sample_ID")
+table(extMeta$Sex, extMeta$DNAme_Sex) # 3 disagreements
+
+extMeta <- extMeta %>% mutate(FAIL_DNAme_Sex =
+                                                ifelse((Sex == "Male" & DNAme_Sex == "XY") |
+                                                         (Sex == "Female" & DNAme_Sex == "XX"),
+                                                       FALSE, TRUE))
+table(extMeta$FAIL_DNAme_Sex) # 3 true
+
+pred_sex_df %>%
+  
+  ggplot(aes(x=X, y=Y, color=DNAme_Sex)) +
+  
+  geom_point() +
+  scale_color_manual(values=c("#997700", "#6699CC") ) +
+  geom_vline(xintercept = pred_sex$cutX) +
+  geom_hline(yintercept = pred_sex$cutY) +
+  
+  labs(title="DNAme-Based Sex",
+       color="Sex",
+       x= "chrX Normalized Total Fluo Intensity",
+       y="chrY Normalized Total Fluo Intensity") +
+  
+  theme_classic() +
+  theme(plot.title = element_text(hjust=0.5))
+
+# remove sex-mismatched samples
+extMeta %>% filter(FAIL_DNAme_Sex == T) # 3, but 2 are the CPM16s and I am not going to investigate sex for those, so I only remove the GSE73375
+
+dim(extMeta) # 271
+extMeta <- extMeta %>% filter(!Sample_ID == "GSM1892060")
+dim(extMeta) # 270
+
+ext <- ext[,colnames(ext) %in% extMeta$Sample_ID]
+dim(ext) # 328
+
+extBMIQ <- extBMIQ[,colnames(extBMIQ) %in% extMeta$Sample_ID]
+dim(extBMIQ) # 328
+
+```
+
+## 3.3 Check identity
+
+```{r}
+
+dim(snp) # 297
+
+extSNP <- snp[,colnames(snp) %in% extMeta$Sample_ID]
+dim(extSNP) # 65 by 171
+extGenotypes <- call_genotypes(extSNP)
+
+
+# EXT
+donors <- colnames(extSNP)
+samples <- colnames(extSNP)
+
+check_snp_agreement(extGenotypes, donor_ids = donors, sample_ids = samples) # 4
+
+x <- extMeta %>% filter(Sample_ID %in% colnames(extSNP))
+dim(x) # 175
+dim(extSNP) # 175
+x$donor_id = enumerate_sample_donors(extGenotypes)
+length(unique(x$donor_id)) # 175 are unique
+
+# identify genetically identical samples 
+dupSamps <- x[duplicated(x$donor_id) | duplicated(x$donor_id, fromLast=TRUE), ] 
+
+# check that the ones that show up as genetically identical are replicates
+dupSamps <- dupSamps %>% dplyr::select(Sample_ID, Subject_ID, GEO_Dataset, Sex, Condition, donor_id)
+
+replicates <- as.data.frame(x) %>% dplyr::filter(grepl('r', Subject_ID) | Condition == "Replicate") %>% dplyr::select(Sample_ID, Subject_ID, GEO_Dataset, Sex, Condition, donor_id)
+
+replicates
+
+dim(replicates) # 1 replicate in GSE100197
+
+```
+
+## 3.4 Index contamination
+
+```{r index contamination}
+
+dim(extMeta) # 270
+extMeta_snps <- extMeta %>% filter(Sample_ID %in% colnames(extSNP))
+dim(extMeta_snps) # 171
+
+extMeta_snps <- extMeta_snps %>%
+  dplyr::mutate(SNP_Outlier = snp_outliers(extGenotypes))
+
+table(extMeta_snps$SNP_Outlier > -4) # up to 8 samples that should be removed
+ 
+ggplot(extMeta_snps, aes(x = Sample_ID, y = SNP_Outlier, col = GEO_Dataset)) +
+  geom_point(alpha=0.8) +
+  geom_label(data = extMeta_snps %>% filter(SNP_Outlier > -2.5), 
+             aes(label = Sample_ID), vjust = 1.5, col = 'grey') +
+  theme_classic() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        plot.title = element_text(hjust=0.5)) +
+  labs(x = 'Sample', y = 'Mean correlation', col = 'Dataset') +
+  geom_hline(yintercept = -4, linetype = 'dashed', color = 'grey') +
+  ggtitle("Mean SNP Outlier Posterior Probability")
+
+# how many of the poor quality 20 are replicates 
+dim(extMeta_snps %>% filter(SNP_Outlier > -4)) # 8
+
+extMeta_SNPoutliers <- extMeta_snps %>% filter(SNP_Outlier > -4)
+
+extMeta_snps <- extMeta_snps %>% mutate(FAIL_SNP_Outlier = ifelse(SNP_Outlier > -4, TRUE, FALSE))
+# i will wait to see if they also fail for failed probes and remove if 2x fail
+
+```
+
+## 3.5 Minfi quality check
+
+```{r}
+
+qc <- getQC(ext)
+plotQC(qc) # several samples appear to be "bad" according to their sample index on the plot
+
+ext <- addQC(ext, qc) # adds uMed and mMed rows to the phenodata of the mSet
+
+fail_minfi <- as.data.frame(pData(ext)) %>%
+  filter(mMed < 10.5) # 5 from GSE73375 and 5 from GSE120981 and several of the TO samples
+
+```
+
+# 4.0 Probe filtering
+
+```{r probe filtering - external}
+
+## POOR QUALITY ##
+ext_detp <- detp[,colnames(detp) %in% extMeta$Sample_ID]
+other_detp <- minfi::detectionP(rgset)
+other_detp <- other_detp[,colnames(other_detp) %in% GSE49343_pDat$Sample_ID]
+
+dim(other_detp) # 485,512 by 15
+colnames(other_detp) <- colnames(mset_16)
+dim(ext_detp) # 485,512 by 259
+
+ext_detp_full <- cbind(ext_detp, other_detp)
+
+dim(ext_detp_full) # 485,512 by 269
+dim(extMeta) # 328
+extMeta_sub <- extMeta %>% filter(Sample_ID %in% colnames(ext_detp_full))
+
+all(colnames(ext_detp_full) == extMeta_sub$Sample_ID) # TRUE
+
+# beadcount
+ext_bc <- bc[,colnames(bc) %in% extMeta_sub$Sample_ID]
+
+dim(ext_bc) # only 114 have beadcounts
+head(ext_bc)
+
+empty <- matrix(,nrow = 485512, ncol = 155)
+head(empty)
+rownames(empty) <- rownames(ext_bc)
+head(empty)
+
+samples_with_detp <- colnames(ext_detp_full) # all samples
+samples_with_bc <- colnames(ext_bc) # only 110 out of the 270
+
+length(samples_with_detp_without_bc <- setdiff(samples_with_detp, samples_with_bc)) # 155, makes sense
+
+colnames(empty) <- samples_with_detp_without_bc
+head(empty)
+
+# substitute NAs of the samples i do not have beadcounts for for any number >3, or else they will be dropped for no reason
+empty[is.na(empty)] <- 10
+head(empty)
+
+ext_bc <- cbind(ext_bc, empty)
+head(ext_bc)
+
+dim(ext_bc) # 485,512 by 269
+
+all(colnames(ext_detp_full) == extMeta_sub$Sample_ID) # TRUE
+all(colnames(ext_bc) == extMeta_sub$Sample_ID) # FALSE
+
+# reorder
+ext_bc <- ext_bc[,colnames(ext_detp_full)]
+all(colnames(ext_bc) == extMeta_sub$Sample_ID) # TRUE
+
+# create a failed probes matrix
+# if detP > 0.01 OR missing value, sum per cell will be > 0
+ext_sub <- extBMIQ[,colnames(extBMIQ) %in% extMeta_sub$Sample_ID]
+ext_dept_full <- ext_detp_full[rownames(ext_detp_full) %in% rownames(ext),]
+ext_bc <- ext_bc[rownames(ext_bc) %in% rownames(ext),]
+
+dim(ext_sub)
+dim(ext_dept_full)
+dim(ext_bc)
+
+fp <- (ext_dept_full>0.01) + is.na(ext_bc) + is.na(ext_sub) 
+fp <- fp > 0
+
+table(rowSums(fp) > ncol(fp)*0.05) # 920 failed probes in > 5% samples
+
+fail_probes <- fp[ rowSums(fp) > ncol(fp)*0.05 ,]
+dim(fail_probes) # 920
+
+# remove failed probes in > 5% samples
+dim(extBMIQ) # 452453
+extBMIQ <- extBMIQ[!(rownames(extBMIQ) %in% rownames(fail_probes)),]
+dim(extBMIQ) # 451533
+
+# identify (& remove) samples with > 5% failed probes
+table(colSums(fp) > nrow(fp)*0.05) # zero failing samps, perfect
+
+
+## CROSS-HYBRIDIZING ##
+
+# remove CH and polymorphic with zhou
+# remove CH and polymorphic with zhou
+zhou_mask <- zhouAnno %>% filter(MASK_general == TRUE)
+dim(zhou_mask) # 60466   
+
+dim(extBMIQ) # 451533    
+table(rownames(extBMIQ) %in% rownames(zhou_mask)) # will lose 55839 in this step
+extBMIQ <- extBMIQ[!(rownames(extBMIQ) %in% rownames(zhou_mask)),]
+dim(extBMIQ) # 395694, 328
+
+# price probes
+## read in files
+Price450K <- read.csv(here::here("Documents", "excel-files", "annotations", "450KMagdaAnnotation.csv"))
+dim(Price450K) # 485512 by 61
+
+# pull ids of cross hyb probes
+Price_CH_XY <- Price450K[grep("YES", Price450K$XY_Hits), ] 
+Price_CH_Auto <- Price450K[grep("YES", Price450K$Autosomal_Hits), ] 
+
+# how many probes in remaining in filtered project are predicted cross hybridizing by 
+dim(extBMIQ[which((rownames(extBMIQ) %in% Price_CH_XY$IlmnID) | rownames(extBMIQ) %in% Price_CH_Auto$IlmnID), ]) # 8405 probes
+
+# remove XY cross hybridizing 
+dim(extBMIQ) # 395694    
+extBMIQ <- extBMIQ[!(rownames(extBMIQ) %in% Price_CH_XY$IlmnID), ] 
+dim(extBMIQ) # 394245   
+
+# remove autosomal cross hybridizing
+extBMIQ <- extBMIQ[!(rownames(extBMIQ) %in% Price_CH_Auto$IlmnID), ]
+dim(extBMIQ) # 387289  
+
+
+## NON-VARIABLE
+
+# function by Rachel Edgar to use on beta values
+Variation <- function(x) {quantile(x, c(0.9), na.rm=T)[[1]]-quantile(x, c(0.1), na.rm=T)[[1]]}
+
+# call variability in our data
+ref_range_extBMIQ <- lapply(1:nrow(extBMIQ), function(x) Variation(extBMIQ[x,]))
+
+# how many probes have a variability range less than 0.05 from the 10th to 90th centile in our dataset
+length(which(ref_range_extBMIQ < 0.05))  # 105306
+
+# create new dataset containing these to overlap with Rachel's list
+dim(beta_invariable_extBMIQ <- extBMIQ[which(ref_range_extBMIQ < 0.05),]) # 105306
+
+# now read in database of probes we know to be invariable in many studies, if also invariable in our dataset, remove
+Edgar_Invariable <- read.table(here::here("Documents", "EdgarInvariable.txt"), header = TRUE, sep = ",", dec = ".")
+dim(Edgar_Invariable) # 101367
+head(Edgar_Invariable)
+
+# which of these invariable probes that are in our dataset
+dim(beta_invariable_extBMIQ <- beta_invariable_extBMIQ[which(rownames(beta_invariable_extBMIQ) %in% Edgar_Invariable$CpG), ]) # 72352
+
+# filter to match
+dim(extBMIQ) # 387289
+extBMIQ <- extBMIQ[which(!(rownames(extBMIQ) %in% rownames(beta_invariable_extBMIQ))), ]
+dim(extBMIQ) # 314937
+
+```
+
+# 5.0 Save objects
+
+```{r}
+
+# save objects with XY probes, just remember to remove later
+
+# remove samples that fail =/>2 checks
+
+# samples that fail intersample cor
+extMeta %>% filter(FAIL_Intersample_Cor == TRUE) # 6 samples, although 5 are from the GSE49343 which i will ignore because i just want to test the predictor on T16s and its reasonable that those samples will look more different
+fail_intersample <- extMeta %>% filter(FAIL_Intersample_Cor == TRUE) %>% pull(Sample_ID)
+
+# samples that fail snp contamination check
+extMeta_snps %>% filter(FAIL_SNP_Outlier == TRUE) # 8 samples, 5 of which are from GSE73375; 1 from GSE98224, and 3 from GSE125605
+fail_contamination <- extMeta_snps %>% filter(FAIL_SNP_Outlier == TRUE) %>% pull(Sample_ID)
+
+# samples that fail minfi QC
+fail_minfi <- fail_minfi %>% pull(Sample_ID)
+
+# now see
+fail_intersample
+fail_contamination
+fail_minfi
+
+intersect(fail_intersample, fail_contamination) # GSM1892058
+intersect(fail_intersample, fail_minfi) # GSM1892058
+
+dim(extBMIQ) # 314937
+extBMIQ <- extBMIQ[,!(colnames(extBMIQ) == "GSM1892058")]
+dim(extBMIQ) # 314937 by 327
+saveRDS(extBMIQ, here::here("Data", "02_Processed", "extQC_BMIQ.rds"))
+write.csv(extMeta, here::here("Data", "02_Processed", "extMeta.csv"))
+
+```

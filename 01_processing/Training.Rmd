@@ -1,0 +1,927 @@
+---
+title: "Data Processing (Sample + Probe Filtering) of the Training group"
+author: "Icíar Fernández Boyano"
+output:
+  md_document:
+    variant: markdown_github
+---
+
+# Introduction
+
+In this Rmd, I process the training group by following a pipeline of sample and probe filtering. Data and metadata parsing code are not shown in this script. I also BMIQ normalize and batch correct this group for dataset effects. At each data transformation step, I run PCA to visualize the data in a way that allows me to understand the effect of the normalization and batch correction.
+
+# Download data from GEO
+
+For this project, I downloaded all of the datasets that I was considering for use and assembled them into a [MethylSet](https://rdrr.io/bioc/minfi/man/MethylSet-class.html), which is comprised of *raw* data.
+
+In the **Data** section, I subset to the four datasets that are included in the training group, and apply the processing pipeline to those samples in the subsequent sections. The four datasets are:
+
+* [GSE100197](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE100197) 
+
+* [GSE103253](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE103253)
+
+* [GSE57767](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE57767)
+
+* [GSE73375](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE73375)
+
+We thank all dataset authors for facilitating this work by making their data public on GEO. 
+
+# Setup
+
+In this section, I load the required packages and objects.
+
+```{r setup}
+
+# PACKAGES
+
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(minfi))
+suppressPackageStartupMessages(library(here))
+suppressPackageStartupMessages(library(janitor))
+suppressPackageStartupMessages(library(tictoc))
+suppressPackageStartupMessages(library(wateRmelon))
+suppressPackageStartupMessages(library(ENmix))
+suppressPackageStartupMessages(library(factoextra))
+suppressPackageStartupMessages(library(ewastools))
+suppressPackageStartupMessages(library(plomics))
+suppressPackageStartupMessages(library(GEOquery))
+suppressPackageStartupMessages(library(doParallel))
+suppressPackageStartupMessages(library(impute))
+suppressPackageStartupMessages(library(sva))
+suppressPackageStartupMessages(library(IlluminaHumanMethylation450kanno.ilmn12.hg19))
+suppressPackageStartupMessages(library(IlluminaHumanMethylation450kmanifest))
+
+# OBJECTS
+
+mset <- readRDS(here("Data", "01_Raw", "complete_mset.rds")) # contains all eight datasets included in the study, directly downloaded and assembled as an mset from GEO by taking the methylated and unmethylated intensities
+
+detp <- readRDS(here("Data", "01_Raw", "detp.rds")) # detection p-value (*not available for all datasets)
+
+snps <- readRDS(here("Data", "01_Raw", "snps.rds")) # single nucleotide polymorphisms (*not available for all datasets)
+
+bc <- readRDS(here("Data", "01_Raw", "beadcount.rds")) # beadcounts (*not available for all datasets)
+
+# PROBE INFO
+
+probeInfo <- cbind(IlluminaHumanMethylation450kanno.ilmn12.hg19::Locations,
+                   IlluminaHumanMethylation450kanno.ilmn12.hg19::Manifest,
+                   IlluminaHumanMethylation450kanno.ilmn12.hg19::Other) %>% as.data.frame()
+
+probeInfo <- rownames_to_column(probeInfo, var="probeID")
+
+chrXY <- probeInfo %>% filter(chr %in% c("chrX", "chrY"))
+chrX <- probeInfo %>% filter(chr %in% c("chrX"))
+chrY <- probeInfo %>% filter(chr %in% c("chrY"))
+
+zhouAnno <- readRDS("Z:/Amy/Data/Probe Info (Illumina Manifests)/Zhou/HM450.hg19.manifest.rds") %>% as.data.frame
+
+```
+
+# Data
+
+I assemble the training group by selecting the datasets that will be included in this group and subsetting the complete MethylSet, which contains all the samples from the raw data of the eight datasets included in this study. 
+
+```{r}
+
+pDat <- as.data.frame(pData(mset))
+
+trainMeta <- pDat %>% 
+  filter(GEO_Dataset %in% c("GSE100197", "GSE103253", "GSE57767", "GSE73375")) %>%
+  filter(!Condition == "Replicate") %>% 
+  filter(!Condition == "IUGR") %>%
+  mutate(Class = case_when(Condition == "EOPE" ~ "EarlyPE",
+                           Condition == "PE" & GA_RPC < 34 ~ "EarlyPE",
+                           Condition == "Non-PE Preterm" ~ "Normotensive",
+                           PE == "No" & GA_RPC < 37 ~ "Normotensive")) %>%
+  mutate(Class = replace_na(Class, "Other")) %>%
+  filter(!Class == "Other")
+
+dim(trainMeta) # 89 by 23
+tabyl(trainMeta, Class) # 47 Early PE and 52 Normotensive
+
+train <- mset[,colnames(mset) %in% trainMeta$Sample_ID]
+dim(train) # 485512 by 89
+
+all(colnames(train) == trainMeta$Sample_ID) # TRUE
+
+```
+
+# Sample QC
+
+## Intersample correlation
+
+```{r}
+
+train_beta <- getBeta(train)
+
+all(colnames(train_beta) == trainMeta$Sample_ID) # TRUE
+
+cor <- cor(na.omit(train_beta))
+sample_cor <- apply(cor, 1, mean)
+sample_cor <- data.frame(mean_sample_cor = sample_cor, 
+                         Sample_ID = as.factor(names(sample_cor)))
+head(sample_cor)
+
+all(sample_cor$Sample_ID == trainMeta$Sample_ID) # TRUE
+
+trainMeta$meanSScor <- sample_cor$mean_sample_cor
+
+ggplot(trainMeta, aes(x = Sample_ID, y = meanSScor)) +
+  geom_point(alpha=0.8) +
+  geom_label(data = trainMeta %>% filter(meanSScor < 0.95), 
+             aes(label = Sample_ID), vjust = 1.5, col = 'grey') +
+  
+  scale_color_manual(values=c("#117733", "#CC6677")) +
+  scale_y_continuous(limits = c(0.9, 1), breaks = seq(0.9, 1, 0.01)) +
+  
+  theme_classic() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        plot.title = element_text(hjust=0.5)) +
+  labs(x = 'Sample', y = 'Mean correlation', col = 'Platform') +
+  geom_hline(yintercept = 0.95, linetype = 'dashed', color = 'grey') +
+  geom_hline(yintercept = 0.96, linetype = 'dashed', color = 'grey') +
+  geom_hline(yintercept = 0.97, linetype = 'dashed', color = 'grey') +
+  ggtitle("Mean Intersample Correlation - Normalized only")
+
+trainMeta %>%
+  filter(meanSScor < 0.95)
+
+# flag samples
+trainMeta <- 
+  trainMeta %>%
+  mutate(FAIL_Intersample_Cor = ifelse(meanSScor < 0.95, TRUE, FALSE))
+
+```
+
+## Sex
+
+In this section, I check the match between genetic (XX/XY) sex and reported sex. Amy Inkster wrote the following code to adapt the `ewastools` check sex functions so that they can be used with an mset rather than using the `read_idats` from `ewastools`. 
+
+```{r}
+
+# ALL CREDIT FOR CODE BELOW IS ATTRIBUTED TO EWASTOOLS PACKAGE AUTHORS (Heiss & Just)
+# For ewastools package info please visit https://github.com/hhhh5/ewastools
+
+# Original ewastools paper:
+# Heiss, J., Just, A. Identifying mislabeled and contaminated DNA methylation
+# microarray data: an extended quality control toolset with examples from GEO. 
+# Clin Epigenet 10, 73 (2018). https://doi.org/10.1186/s13148-018-0504-1
+
+# function equivalent to ewastools::check_sex(), pull sample XY intensity norm to auto
+
+mset_check_sex = function(mset){
+  
+  if(!"tidyverse" %in% installed.packages()) {
+    install.packages("tidyverse")
+  }
+  
+  
+  if(!"BiocManager" %in% installed.packages()) {
+    install.packages("BiocManager")
+  }
+  
+  if(!"minfi" %in% installed.packages()) {
+    BiocManager::install("minfi")
+  }
+  
+  require(tidyverse)
+  require(minfi)
+  
+  # define M, U, and probe anno objects
+  M = minfi::getMeth(mset) %>% as.data.frame()
+  U = minfi::getUnmeth(mset) %>% as.data.frame()
+  anno = minfi::getAnnotation(mset) %>% as.data.frame() # annotation with "chr" column, entries chr1 - chrY, probeIDs as rownames
+	
+  
+  # select allosomal probes
+  chrX = dimnames(anno[anno$chr=='chrX',])[[1]]
+  chrY = dimnames(anno[anno$chr=='chrY',])[[1]]
+  
+  # compute the total intensities
+  chrX = colMeans(M[chrX,,drop=FALSE]+U[chrX,,drop=FALSE],na.rm=TRUE)
+  chrY = colMeans(M[chrY,,drop=FALSE]+U[chrY,,drop=FALSE],na.rm=TRUE)
+  
+  # compute the average total intensity across all autosomal probes
+  autosomes = dimnames(anno[!anno$chr %in% c("chrX","chrY"),])[[1]]
+  autosomes = colMeans(M[autosomes,,drop=FALSE]+U[autosomes,,drop=FALSE],na.rm=TRUE)
+  
+  # normalize total intensities
+  chrX_nonorm = chrX
+  chrY_nonorm = chrY
+  
+  chrX = chrX/autosomes
+  chrY = chrY/autosomes
+  
+  # define a df with the output
+  xy_int = data.frame(Sample_ID = dimnames(mset)[[2]],
+                      Array = annotation(mset)[[1]],
+                      X = chrX,
+                      Y = chrY,
+                      X_nonorm = chrX_nonorm,
+                      Y_nonorm = chrY_nonorm)
+  
+	return((xy_int))
+}
+
+mset_predict_sex = function(sex_int,male,female){
+
+	# compute the robust Hodges-Lehmann estimator for the total intensity for X chr probes
+	cutX = outer(sex_int$X[male],sex_int$X[female],"+")
+	cutX = median(cutX)/2
+
+	# ... likewise for Y chr probes
+	cutY = outer(sex_int$Y[male],sex_int$Y[female],"+")
+	cutY = median(cutY)/2
+
+	# Prediction based on in which quadrant (cutX/cutY) samples fall
+	DNAme_Sex = rep(NA,times=length(sex_int$X))
+	DNAme_Sex[sex_int$X>=cutX & sex_int$Y<=cutY] =  "XX"
+	DNAme_Sex[sex_int$X<=cutX & sex_int$Y>=cutY] =  "XY"
+	factor(DNAme_Sex,levels=c("XY","XX"),labels=c("XY","XX"))
+	
+	sex_preds = cbind(sex_int, DNAme_Sex)
+	
+	results = list("Sex_Preds" = sex_preds, "cutX" = cutX, "cutY" = cutY) 
+	
+	return(results)
+}
+
+```
+
+```{r}
+
+pred_sex <- mset_check_sex(train)
+
+male <- trainMeta$Sex == "Male"
+female <- trainMeta$Sex == "Female"
+
+pred_sex <- mset_predict_sex(pred_sex, male, female)
+pred_sex_df <- pred_sex$Sex_Preds
+
+trainMeta <- trainMeta %>% left_join(pred_sex_df %>% dplyr::select(Sample_ID, X, Y, DNAme_Sex), by="Sample_ID")
+table(trainMeta$Sex, trainMeta$DNAme_Sex) # two disagreements
+
+trainMeta <- trainMeta %>% mutate(FAIL_DNAme_Sex =
+                                    ifelse((Sex == "Male" & DNAme_Sex == "XY") |
+                                   (Sex == "Female" & DNAme_Sex == "XX"), 
+                                 FALSE, TRUE))
+table(trainMeta$FAIL_DNAme_Sex) 
+trainMeta %>% filter(FAIL_DNAme_Sex == T) 
+
+pred_sex_df %>%
+  
+  ggplot(aes(x=X, y=Y, color=DNAme_Sex)) +
+  
+  geom_point() +
+  scale_color_manual(values=c("#997700", "#6699CC") ) +
+  geom_vline(xintercept = pred_sex$cutX) +
+  geom_hline(yintercept = pred_sex$cutY) +
+  
+  labs(title="DNAme-Based Sex",
+       color="Sex",
+       x= "chrX Normalized Total Fluo Intensity",
+       y="chrY Normalized Total Fluo Intensity") +
+  
+  theme_classic() +
+  theme(plot.title = element_text(hjust=0.5))
+
+# remove sex-mismatched samples
+dim(trainMeta) # 89
+trainMeta <- trainMeta %>% filter(!Sample_ID %in% c("GSM1892055", "GSM2759051"))
+dim(trainMeta) # 87
+
+train <- train[,colnames(train) %in% trainMeta$Sample_ID]
+
+dim(train) # 87
+
+```
+
+## SNP identity with `ewastools`
+
+```{r}
+
+# ALL CREDIT FOR CODE BELOW IS ATTRIBUTED TO EWASTOOLS PACKAGE AUTHORS (Heiss & Just)
+# For ewastools package info please visit https://github.com/hhhh5/ewastools
+
+# Original ewastools paper:
+# Heiss, J., Just, A. Identifying mislabeled and contaminated DNA methylation
+# microarray data: an extended quality control toolset with examples from GEO. 
+# Clin Epigenet 10, 73 (2018). https://doi.org/10.1186/s13148-018-0504-1
+
+# function equivalent to ewastools::check_sex(), pull sample XY intensity norm to auto
+
+# note that not all samples had SNP information
+
+dim(snps) # 297
+
+trainSNP <- snps[,colnames(snps) %in% trainMeta$Sample_ID]
+dim(trainSNP) # 65 by 68
+
+trainGenotypes <- call_genotypes(trainSNP)
+
+# label samples with donor ID and number of times present in data genetically
+
+donors <- colnames(trainSNP)
+samples <- colnames(trainSNP)
+
+check_snp_agreement(trainGenotypes, donor_ids = donors, sample_ids = samples) # 0
+
+```
+
+## SNP contamination with `ewastools`
+
+```{r}
+
+dim(trainMeta) # 87
+trainMeta_snps <- trainMeta %>% filter(Sample_ID %in% colnames(trainSNP))
+dim(trainMeta_snps) # 68
+
+trainMeta_snps <- trainMeta_snps %>%
+  dplyr::mutate(SNP_Outlier = snp_outliers(trainGenotypes))
+ 
+ggplot(trainMeta_snps, aes(x = Sample_ID, y = SNP_Outlier, col = GEO_Dataset)) +
+  geom_point(alpha=0.8) +
+  geom_label(data = trainMeta_snps %>% filter(SNP_Outlier > -2.5), 
+             aes(label = Sample_ID), vjust = 1.5, col = 'grey') +
+  theme_classic() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        plot.title = element_text(hjust=0.5)) +
+  labs(x = 'Sample', y = 'Mean correlation', col = 'Dataset') +
+  geom_hline(yintercept = -4, linetype = 'dashed', color = 'grey') +
+  ggtitle("Mean SNP Outlier Posterior Probability")
+
+train_SNPoutliers <- trainMeta_snps %>% filter(SNP_Outlier > -4)
+
+# i will wait to see if they also fail for failed probes and remove if 2x fail
+trainMeta <- 
+  trainMeta %>%
+  mutate(FAIL_Contamination_Check = ifelse(Sample_ID %in% train_SNPoutliers$Sample_ID, TRUE, FALSE))
+
+```
+
+## Sample quality with `minfi`
+
+```{r}
+
+qc <- getQC(train)
+plotQC(qc) 
+
+train <- addQC(train, qc) # adds uMed and mMed rows to the phenodata of the mSet
+as.data.frame(pData(train)) %>%
+  filter(mMed < 10.5) 
+
+```
+
+
+# Probe QC
+
+```{r probe filtering - train}
+
+## POOR QUALITY ##
+
+# detection p value
+train_detp <- detp[,colnames(detp) %in% trainMeta$Sample_ID]
+dim(train_detp) 
+dim(trainMeta) 
+
+# beadcount
+train_bc <- bc[,colnames(bc) %in% trainMeta$Sample_ID]
+dim(train_bc) # 50 - not all have beadcounts
+head(train_bc)
+
+empty <- matrix(,nrow = 485512, ncol = 37)
+head(empty)
+rownames(empty) <- rownames(train_bc)
+head(empty)
+
+samples_with_detp <- colnames(train_detp) # all samples
+samples_with_bc <- colnames(train_bc) # only 50 out of the 87
+
+length(samples_with_detp_without_bc <- setdiff(samples_with_detp, samples_with_bc)) # 37, makes sense
+
+colnames(empty) <- samples_with_detp_without_bc
+head(empty)
+
+# substitute NAs of the samples i do not have beadcounts for for any number >3, or else they will be dropped for no reason
+empty[is.na(empty)] <- 10
+head(empty)
+
+train_bc <- cbind(train_bc, empty)
+head(train_bc)
+
+all(colnames(train_detp) == trainMeta$Sample_ID) 
+all(colnames(train_bc) == trainMeta$Sample_ID) 
+
+# reorder
+train_bc <- train_bc[,colnames(train_detp)]
+all(colnames(train_bc) == trainMeta$Sample_ID) 
+
+# after dropping samples, update sex vectors
+female <- trainMeta$Sex == "Female"
+male <- trainMeta$Sex == "Male"
+
+sum(female) 
+sum(male) 
+
+# for female Y chromosome, set detp to 0 (they are not failing so not > 0.05)
+train_detp[rownames(train_detp) %in% chrY$probeID, female] <- 0
+
+# create a failed probes matrix
+# if detP > 0.01 OR bc<3 (NA) OR missing value, sum per cell will be > 0
+fp <- (train_detp>0.01) + is.na(train_bc) + is.na(train)
+fp <- fp > 0
+
+table(rowSums(fp) > ncol(fp)*0.05) # 1151 failed probes in > 1% samples
+
+fail_probes <- fp[ rowSums(fp) > ncol(fp)*0.05 ,]
+dim(fail_probes) 
+
+# remove failed probes in > 5% samples
+dim(train) # 485512  
+train <- train[!(rownames(train) %in% rownames(fail_probes)),]
+dim(train) # 484361 
+
+# identify (& remove) samples with > 5% failed probes
+table(colSums(fp) > nrow(fp)*0.05) # zero failing samples
+
+
+
+## CROSS-HYBRIDIZING ##
+
+# remove CH and polymorphic with zhou
+zhou_mask <- zhouAnno %>% filter(MASK_general == TRUE)
+dim(zhou_mask)    
+
+dim(train)      
+table(rownames(train) %in% rownames(zhou_mask)) 
+train <- train[!(rownames(train) %in% rownames(zhou_mask)),]
+dim(train) 
+
+# price probes
+## read in files
+Price450K <- read.csv(here::here("Documents", "excel-files", "annotations", "450KMagdaAnnotation.csv"))
+dim(Price450K) 
+
+# pull ids of cross hyb probes
+Price_CH_XY <- Price450K[grep("YES", Price450K$XY_Hits), ] 
+Price_CH_Auto <- Price450K[grep("YES", Price450K$Autosomal_Hits), ] 
+dim(train[which((rownames(train) %in% Price_CH_XY$IlmnID) | rownames(train) %in% Price_CH_Auto$IlmnID), ])
+
+# remove XY cross hybridizing 
+dim(train) 
+train <- train[!(rownames(train) %in% Price_CH_XY$IlmnID), ] 
+dim(train) 
+
+# remove autosomal cross hybridizing
+train <- train[!(rownames(train) %in% Price_CH_Auto$IlmnID), ]
+dim(train) 
+
+
+
+## NON-VARIABLE
+
+# need beta values for this step
+betas_train <- getBeta(train)
+
+# function by Rachel Edgar to use on beta values
+Variation <- function(x) {quantile(x, c(0.9), na.rm=T)[[1]]-quantile(x, c(0.1), na.rm=T)[[1]]}
+
+# call variability in our data
+ref_range_train <- lapply(1:nrow(betas_train), function(x) Variation(betas_train[x,]))
+
+# how many probes have a variability range less than 0.05 from the 10th to 90th centile in our dataset
+length(which(ref_range_train < 0.05))  
+
+# create new dataset containing these to overlap with Rachel's list
+dim(beta_invariable_train <- betas_train[which(ref_range_train < 0.05),]) 
+
+
+# now read in database of probes we know to be invariable in many studies, if also invariable in our dataset, remove
+Edgar_Invariable <- read.table(here::here("Documents", "EdgarInvariable.txt"), header = TRUE, sep = ",", dec = ".")
+dim(Edgar_Invariable) 
+head(Edgar_Invariable)
+
+# which of these invariable probes that are in our dataset
+dim(beta_invariable_train <- beta_invariable_train[which(rownames(beta_invariable_train) %in% Edgar_Invariable$CpG), ]) 
+
+# filter to match
+dim(train) 
+train <- train[which(!(rownames(train) %in% rownames(beta_invariable_train))), ]
+dim(train) 
+
+```
+
+# Finish QC
+
+Based on our previous observation that GSE73375 has a large cohort-specific effect that may be due to technical variation (see [Yuan et al., 2019](https://epigeneticsandchromatin.biomedcentral.com/articles/10.1186/s13072-019-0296-3#Sec1), Figure S1), we modified our criteria to remove samples that failed one or more checks in this dataset such that any samples that failed any single check would be removed. As a result, we removed GSM1892032, GSM1892056, and GSM1892059, which failed two checks, but also GSE1892047, even though it failed a single check. 
+
+```{r}
+
+# remove XY probes and probes that are not in the EPIC array
+
+dim(train <- train[!rownames(train) %in% chrXY$probeID,]) 
+dim(train <- train[rownames(train) %in% rownames(IlluminaHumanMethylationEPICanno.ilm10b4.hg19::Manifest),]) 
+
+trainBetas <- getBeta(train)
+trainMVals <- lumi::beta2m(trainBetas)
+
+dim(trainBetas) 
+range(trainBetas, na.rm=TRUE) 
+dim(trainMVals) 
+range(trainMVals, na.rm=TRUE, finite=TRUE) 
+
+sum(is.na(trainBetas)) 
+
+# remove samples that failed qc
+
+dim(train) 
+train <- train[,!(colnames(train) %in% c("GSM1892032", "GSM1892047", "GSM1892056", "GSM1892059"))]
+dim(train) 
+
+```
+
+# PCA (filtered+raw data)
+
+```{r pca filt}
+
+pca <- prcomp(t(na.omit(trainBetas)), center=TRUE)
+pca_summary <- summary(pca)
+
+loadings <- pca$x
+dim(loadings) 
+rownames(loadings) <- rownames(trainMeta)
+head(loadings) 
+
+fviz_eig(pca, geom = "bar", bar_width = 0.5, 
+              addlabels = TRUE, hjust = -0.3,
+              barfill = "#BF98A0", barcolor = "#BF98A0") + 
+  ggtitle("PCA Variances of Training Data (Filtered, Pre-Normalization)") +
+  theme_minimal() +
+  labs(x = "Principal Components", y = "% of explained variances")
+
+# rename columns
+pca_scores <- pca$x %>% as_tibble() %>% mutate(Sample_Name = trainMeta$Sample_ID) 
+
+# r squared
+pca_cor_rs <- lmmatrix(dep = pca_scores[,1:10],
+                        ind = as.data.frame(trainMeta) %>% 
+                          dplyr::select(GEO_Dataset,
+                                        Sex, 
+                                        PE,
+                                        Class,
+                                        GA_RPC,
+                                        Predicted_ethnicity_nothresh),
+                       metric = 'Rsquared')
+
+pca_plot_rs <- pca_cor_rs %>% as.data.frame() %>% 
+  mutate(indep = rownames(pca_cor_rs)) %>%
+ pivot_longer(c(-indep), names_to = "PC", values_to = "rsqr" ) %>%
+  mutate(
+  PC = factor(PC, levels = colnames(pca_cor_rs))) %>% as_tibble()
+
+# Plot PCA 
+p1_r <- ggplot(pca_plot_rs, aes(x = PC, y = indep, fill = rsqr)) +
+  geom_tile(col = 'lightgrey') + theme_classic() +
+  scale_x_discrete(expand = c(0, 0), labels = 1:20) +
+  scale_y_discrete(expand = c(0, 0)) +
+  labs(y = '', fill = 'R Squared') +
+  scale_fill_gradientn(colors = c("#ff4d00", "#f98010", "#f09623", "#e9b448")) +
+  ggtitle("PCA - Training Data (Filtered, Pre-Normalization)") 
+
+p1_r
+
+as.data.frame(pca_cor_rs) %>%
+  filter(PC1 > 0.5) # Dataset has an R-squared of > 0.5 with PC1, no other variables do
+
+# p value
+pca_cor_pval <- lmmatrix(dep = pca_scores[,1:10],
+                        ind = as.data.frame(trainMeta) %>% 
+                          dplyr::select(GEO_Dataset,
+                                        Sex, 
+                                        PE,
+                                        Class,
+                                        GA_RPC,
+                                        Predicted_ethnicity_nothresh),
+                       metric = 'Pvalue')
+
+pca_plot_pval <- pca_cor_pval %>% as.data.frame() %>% 
+  mutate(indep = rownames(pca_cor_pval)) %>%
+ pivot_longer(c(-indep), names_to = "PC", values_to = "pval" ) %>%
+  mutate(
+  PC = factor(PC, levels = colnames(pca_cor_pval))) %>% as_tibble()
+
+# Plot PCA 
+p1_r <- ggplot(pca_plot_pval, aes(x = PC, y = indep, fill = pval)) +
+  geom_tile(col = 'lightgrey') + theme_classic() +
+  scale_x_discrete(expand = c(0, 0), labels = 1:20) +
+  scale_y_discrete(expand = c(0, 0)) +
+  labs(y = '', fill = 'P Value') +
+  scale_fill_gradientn(colors = c("#0047AB", "#6495ED", "#ADD8E6")) +
+  ggtitle("PCA - Training Data (Filtered, Pre-Normalization)") 
+
+p1_r # also strongly associated to Dataset, Sex, Ethnicity, but not so much class
+
+as.data.frame(pca_cor_pval) %>%
+  filter(PC1 < 0.01) # Dataset is the only variable has a p-val < 0.01 to PC1 *and* PC2
+
+as.data.frame(pca_cor_pval) %>%
+  filter(PC1 < 0.05) # No other variables are actually significantly associated to PC1 with a p-val of less than 0.05
+
+# plot betas by type
+probeDesign <- data.frame(Type = getProbeType(train, withColor = FALSE))
+probeID <- rownames(train)
+probeDesign$Name <- probeID
+any(is.na(probeDesign)) 
+
+plotBetasByType(train[,1], main="Training Data - Raw (Filtered)")
+
+# clear environment
+rm(pca)
+rm(pca_cor_pval)
+rm(pca_cor_rs)
+rm(pca_plot_pval)
+rm(pca_plot_rs)
+rm(pca_scores)
+rm(pca_summary)
+gc()
+
+```
+
+# Normalization
+
+```{r}
+
+dim(train) # 341,281 by 83
+
+## normalize
+set.seed(2022)
+tictoc::tic()
+trainBMIQ <- wateRmelon::BMIQ(train)
+tictoc::toc() 
+# 398.54 sec
+
+```
+
+# PCA (filtered+normalized data)
+
+```{r pca filt_norm}
+
+plotBetasByType(as.matrix(trainBMIQ)[,1], probeTypes = as.data.frame(probeDesign), main="Training Data - BMIQ Normalized + Filtered")
+
+dim(trainBMIQ)
+dim(trainMeta)
+
+trainMeta <- trainMeta %>% filter(Sample_ID %in% colnames(trainBMIQ))
+
+all(colnames(trainBMIQ) == trainMeta$Sample_ID)
+
+## run PCA again
+pca <- prcomp(t(na.omit(trainBMIQ)), center = TRUE)
+pca_summary <- summary(pca)
+
+loadings <- pca$x
+dim(loadings) 
+rownames(loadings) <- trainMeta$Sample_ID
+head(loadings) 
+
+fviz_eig(pca, geom = "bar", bar_width = 0.5, 
+              addlabels = TRUE, hjust = -0.3,
+              barfill = "#BF98A0", barcolor = "#BF98A0") + 
+  ggtitle("PCA Variances of Training Data (Filtered, BMIQ Normalized)") +
+  theme_minimal() +
+  labs(x = "Principal Components", y = "% of explained variances")
+
+# rename columns
+pca_scores <- pca$x %>% as_tibble() %>% mutate(Sample_Name = trainMeta$Sample_ID) 
+
+# r squared
+pca_cor_rs <- lmmatrix(dep = pca_scores[,1:10],
+                        ind = as.data.frame(trainMeta) %>% 
+                          dplyr::select(GEO_Dataset,
+                                        Sex, 
+                                        PE,
+                                        Class,
+                                        GA_RPC,
+                                        Predicted_ethnicity_nothresh),
+                       metric = 'Rsquared')
+
+pca_plot_rs <- pca_cor_rs %>% as.data.frame() %>% 
+  mutate(indep = rownames(pca_cor_rs)) %>%
+ pivot_longer(c(-indep), names_to = "PC", values_to = "rsqr" ) %>%
+  mutate(
+  PC = factor(PC, levels = colnames(pca_cor_rs))) %>% as_tibble()
+
+# Plot PCA 
+p1_r <- ggplot(pca_plot_rs, aes(x = PC, y = indep, fill = rsqr)) +
+  geom_tile(col = 'lightgrey') + theme_classic() +
+  scale_x_discrete(expand = c(0, 0), labels = 1:20) +
+  scale_y_discrete(expand = c(0, 0)) +
+  labs(y = '', fill = 'R Squared') +
+  scale_fill_gradientn(colors = c("#ff4d00", "#f98010", "#f09623", "#e9b448")) +
+  ggtitle("PCA - Training Data (Filtered, BMIQ Normalized)") 
+
+p1_r
+
+as.data.frame(pca_cor_rs) %>%
+  filter(PC1 > 0.5) 
+
+as.data.frame(pca_cor_rs) %>%
+  filter(PC1 > 0.4) 
+
+
+# p value
+pca_cor_pval <- lmmatrix(dep = pca_scores[,1:10],
+                        ind = as.data.frame(trainMeta) %>% 
+                          dplyr::select(GEO_Dataset,
+                                        Sex, 
+                                        PE,
+                                        Class,
+                                        GA_RPC,
+                                        Predicted_ethnicity_nothresh),
+                       metric = 'Pvalue')
+
+pca_plot_pval <- pca_cor_pval %>% as.data.frame() %>% 
+  mutate(indep = rownames(pca_cor_pval)) %>%
+ pivot_longer(c(-indep), names_to = "PC", values_to = "pval" ) %>%
+  mutate(
+  PC = factor(PC, levels = colnames(pca_cor_pval))) %>% as_tibble()
+
+# Plot PCA 
+p1_r <- ggplot(pca_plot_pval, aes(x = PC, y = indep, fill = pval)) +
+  geom_tile(col = 'lightgrey') + theme_classic() +
+  scale_x_discrete(expand = c(0, 0), labels = 1:20) +
+  scale_y_discrete(expand = c(0, 0)) +
+  labs(y = '', fill = 'P Value') +
+  scale_fill_gradientn(colors = c("#0047AB", "#6495ED", "#ADD8E6")) +
+  ggtitle("PCA - Training Data (Filtered, BMIQ Normalized)") 
+
+p1_r
+
+as.data.frame(pca_cor_pval) %>%
+  filter(PC1 < 0.05) 
+
+as.data.frame(pca_cor_pval) %>%
+  filter(PC1 < 0.01) 
+
+```
+
+# Batch correction
+
+```{r combat, warning=FALSE, message=FALSE}
+
+## combat correct
+
+# create model matrix to protect variables
+combat_mod <- model.matrix(~as.factor(Class) + 
+                             as.factor(Sex) + 
+                             GA_RPC + 
+                             Prob_Asian + 
+                             Prob_African, 
+                           data = trainMeta)
+
+head(combat_mod) 
+
+sum(is.na(trainBMIQ)) # 611
+
+# impute NAs to be able to run combat
+set.seed(2022)
+
+cluster <- makeCluster(16)
+registerDoParallel(cluster)
+
+tic()
+trainBMIQ_noNA <- impute.knn(as.matrix(trainBMIQ), maxp = 15000)$data
+toc() 
+
+sum(is.na(trainBMIQ_noNA)) # 0
+
+stopCluster(cluster)
+stopImplicitCluster()
+
+# convert to mvals
+mvals <- lumi::beta2m(trainBMIQ_noNA)
+dim(mvals) 
+range(mvals) 
+
+all(colnames(mvals) == trainMeta$Sample_ID) 
+
+tic()
+combat_mvals <- sva::ComBat(dat=mvals,
+                            batch=trainMeta$GEO_Dataset,
+                            mod=combat_mod,
+                            par.prior = T,
+                            prior.plots = F)
+toc() 
+
+all(trainMeta$Sample_ID == colnames(trainBMIQ))  
+all(trainMeta$Sample_ID == colnames(mvals)) 
+dim(combat_mvals) 
+
+range(combat_mvals) 
+
+trainComBat <- lumi::m2beta(combat_mvals)
+
+dim(trainComBat) 
+range(trainComBat) 
+
+```
+
+# PCA (filtered+normalized+batch corrected data)
+
+```{r pca filt_norm_batchcorrected}
+
+plotBetasByType(as.matrix(trainComBat)[,1], probeTypes = as.data.frame(probeDesign), main="Training Data - Batch Corrected + BMIQ Normalized + Filtered") 
+
+# now check pca
+pca <- prcomp(t(na.omit(trainComBat)), n = 10)
+pca_summary <- summary(pca)
+
+loadings <- pca$x
+dim(loadings) 
+rownames(loadings) <- rownames(trainMeta)
+head(loadings) 
+
+fviz_eig(pca, geom = "bar", bar_width = 0.5, 
+              addlabels = TRUE, hjust = -0.3,
+              barfill = "#BF98A0", barcolor = "#BF98A0") + 
+  ggtitle("PCA Variances of Training Data (Filtered, BMIQ Norm, Batch Corrected)") +
+  theme_minimal() +
+  labs(x = "Principal Components", y = "% of explained variances")
+
+# rename columns
+pca_scores <- pca$x %>% as_tibble() %>% mutate(Sample_Name = trainMeta$Sample_ID) 
+
+# r squared
+pca_cor_rs <- lmmatrix(dep = pca_scores[,1:10],
+                        ind = as.data.frame(trainMeta) %>% 
+                          dplyr::select(GEO_Dataset,
+                                        Sex, 
+                                        PE,
+                                        Class,
+                                        GA_RPC,
+                                        Predicted_ethnicity_nothresh),
+                       metric = 'Rsquared')
+
+pca_plot_rs <- pca_cor_rs %>% as.data.frame() %>% 
+  mutate(indep = rownames(pca_cor_rs)) %>%
+ pivot_longer(c(-indep), names_to = "PC", values_to = "rsqr" ) %>%
+  mutate(
+  PC = factor(PC, levels = colnames(pca_cor_rs))) %>% as_tibble()
+
+# Plot PCA 
+p1_r <- ggplot(pca_plot_rs, aes(x = PC, y = indep, fill = rsqr)) +
+  geom_tile(col = 'lightgrey') + theme_classic() +
+  scale_x_discrete(expand = c(0, 0), labels = 1:20) +
+  scale_y_discrete(expand = c(0, 0)) +
+  labs(y = '', fill = 'R Squared') +
+  scale_fill_gradientn(colors = c("#ff4d00", "#f98010", "#f09623", "#e9b448")) +
+  ggtitle("PCA - Training Data (Filtered, BMIQ Normalized, Batch Corrected)") 
+
+p1_r
+
+as.data.frame(pca_cor_rs) %>%
+  filter(PC1 > 0.1) # no variables are no longer strongly associated to PC1 anymore after combat correction (all less than 0.5), PE and class are 0.21
+
+
+# p value
+pca_cor_pval <- lmmatrix(dep = pca_scores[,1:10],
+                        ind = as.data.frame(trainMeta) %>% 
+                          dplyr::select(GEO_Dataset,
+                                        Sex, 
+                                        PE,
+                                        Class,
+                                        GA_RPC,
+                                        Predicted_ethnicity_nothresh),
+                       metric = 'Pvalue')
+
+pca_plot_pval <- pca_cor_pval %>% as.data.frame() %>% 
+  mutate(indep = rownames(pca_cor_pval)) %>%
+ pivot_longer(c(-indep), names_to = "PC", values_to = "pval" ) %>%
+  mutate(
+  PC = factor(PC, levels = colnames(pca_cor_pval))) %>% as_tibble()
+
+# Plot PCA 
+p1_r <- ggplot(pca_plot_pval, aes(x = PC, y = indep, fill = pval)) +
+  geom_tile(col = 'lightgrey') + theme_classic() +
+  scale_x_discrete(expand = c(0, 0), labels = 1:20) +
+  scale_y_discrete(expand = c(0, 0)) +
+  labs(y = '', fill = 'P Value') +
+  scale_fill_gradientn(colors = c("#0047AB", "#6495ED", "#ADD8E6")) +
+  ggtitle("PCA - Training Data (Filtered, BMIQ Normalized, Batch Corrected)")
+
+p1_r
+
+as.data.frame(pca_cor_pval) %>%
+  filter(PC1 < 0.05) # PE and Class, but not Dataset.
+
+```
+
+# Save
+
+```{r}
+saveRDS(trainComBat, here::here("Code", "2022_GitHub", "01_Data", "train.rds"))
+write.csv(trainMeta, here::here("Code", "2022_GitHub", "01_Data", "trainMeta.csv"))
+```
+

@@ -1,0 +1,511 @@
+---
+title: "Develop, assess, and externally validate eoPred using sPLS-DA and CV"
+author: "Icíar Fernández Boyano"
+date: "Originally developed on May 30th-June 22nd, 2022 - Updated (tidy version) on October 26th, 2022"
+subtitle: "Last sanity check + knit on March 2023"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo 
+editor_options: 
+  chunk_output_type: console
+---
+
+# 1.0 Setup
+
+In this script, I will be using repeated M-fold cross validation to develop a model that is able to predict the outcome EOPE/nPTB on new observations, using the package `mixOmics`.
+
+In the next few chunks of code, I load the training data and prepare it for model training by 1) subsetting it to only those probes that are in the EPIC array, 2) BMIQ normalization, and 3) correcting for batch (dataset) effects. Note that the training data was already processed in a separate script (Aim1_PredictPE/Code/01_Preprocessing/2022_Manuscript_FinalScripts/01QC_Training), independently from the validation and exploratory cohorts.
+
+In the below chunk of code, I load the packages that I will be using and prepare the "probeInfo" object that I will be using to investigate the probes that are selected as predictive by the model. 
+
+```{r warning=FALSE, message=FALSE}
+
+library(tidyverse)
+library(mixOmics)
+library(here)
+library(tictoc)
+library(doParallel)
+library(impute)
+library(sva)
+library(missMethyl)
+library(janitor)
+library(factoextra)
+library(plomics)
+library(tidyr)
+library(ENmix)
+
+# PROBE INFO
+
+probeInfo <- cbind(IlluminaHumanMethylation450kanno.ilmn12.hg19::Locations,
+                   IlluminaHumanMethylation450kanno.ilmn12.hg19::Manifest,
+                      IlluminaHumanMethylation450kanno.ilmn12.hg19::Other) %>% as.data.frame()
+
+probeInfo <- rownames_to_column(probeInfo, var="probeID")
+
+chrXY <- probeInfo %>% filter(chr %in% c("chrX", "chrY"))
+chrX <- probeInfo %>% filter(chr %in% c("chrX"))
+chrY <- probeInfo %>% filter(chr %in% c("chrY"))
+
+```
+
+Below, I load in the processed training data and prepare the metadata for training (i.e., by creating the "Class" column that the predictor will use).
+
+```{r load data and metadata, warning=FALSE, message=FALSE}
+
+# read in independently QC'd and normalized training and testing data
+
+here::here() # "Z:/Icíar/Projects/Aim1_PredictPE"
+
+# objects
+train_mset <- readRDS(here::here("Data", "02_Processed", "trainQC.rds"))
+train <- readRDS(here::here("Data", "02_Processed", "trainQC_BMIQ_BC.rds"))
+
+trainMeta <- as.data.frame(pData(train_mset))
+rm(train_mset)
+
+# sanity checks
+all(colnames(train) == trainMeta$Sample_ID) # TRUE - ok good
+
+dim(train) # 341,281 by 83
+
+# set up metadata
+trainMeta <- trainMeta %>%
+  mutate(Class = case_when(Condition == "EOPE" ~ "EOPE",
+                           Condition == "PE" & GA_RPC < 34 ~ "EOPE",
+                           Condition == "Non-PE Preterm" ~ "Non-PE Preterm",
+                           PE == "No" & GA_RPC < 37 ~ "Non-PE Preterm")) %>%
+  mutate(Class = replace_na(Class, "Other")) %>%
+  filter(!Class == "Other")
+
+tabyl(trainMeta, Class) # 42 EOPE and 41 Non-PE Preterm
+
+# sanity checks again
+train <- train[,colnames(train) %in% trainMeta$Sample_ID]
+all(colnames(train) == trainMeta$Sample_ID) # TRUE - ok good
+dim(train) # 341281 by 83
+
+any(chrXY$probeID %in% rownames(train)) # FALSE - good, just a sanity check
+write.csv(trainMeta, here("Data", "03_Predictor", "trainMeta.csv"))
+
+```
+
+# 2.0 Develop and assess models using cross-validation
+
+In this section, I will likely be performing several rounds of cross-validation to train the model. I want the model to be as simple as possible without sacrificing too much performance, so on each round of cross-validation I will try to reduce the range of the training grid and increase the resolution, as I have read it is recommended on the mixOmics documentation. 
+
+```{r training round 1}
+
+# load in data
+
+x_train <- t(as.data.frame(train))
+dim(x_train) # 83 by 341,281
+
+y_train <- trainMeta$Class
+all(rownames(x_train) == trainMeta$Sample_ID) # TRUE, good - just an extra sanity check
+length(y_train) # 83
+y_train <- factor(y_train)
+
+saveRDS(x_train, here("Data", "03_Predictor", "x_train.rds"))
+saveRDS(y_train, here("Data", "03_Predictor", "y_train.rds"))
+
+
+## use perf() on an arbitrarily high number of components
+
+tic()
+splsdaRes <- splsda(x_train,  
+                    y_train, 
+                    ncomp = 10) # there are only two classes, but testing 10 by following the example from the vignette
+toc() # 10.8 sec elapsed
+
+set.seed(2022)
+
+tic()
+splsdaPerf <- perf(splsdaRes,
+                   validation = "Mfold",
+                   folds = 3,
+                   progressBar = FALSE,
+                   nrepeat = 50)
+toc() 
+# 12653.05 sec elapsed - around 4 hours
+
+gc()
+
+png(here::here("Output", "2022_Manuscript", "02_Cross-Validation", "01_CVRound1_Components.png"),
+    width = 2000,
+    height = 1500,
+    res = 300)
+
+plot(splsdaPerf, 
+     col = color.mixo(5:7), 
+     sd = TRUE, 
+     legend.position = "horizontal")
+
+dev.off()
+
+splsdaPerf$choice.ncomp # 4 components is the optimal number for BER using the max.dist, 3 using the centroids.dist and 4 using the mahalanobis.dist, but i plan on using the max dist
+
+## run the tune() function iteratively with the ncomp from perf
+
+keepXlist <- c(seq(10, 100, 10))
+keepXlist # to output the grid of values tested
+
+choice.ncomp <- splsdaPerf$choice.ncomp[2,1]
+choice.ncomp
+
+set.seed(2022) 
+
+tictoc::tic()
+tune.splsda.v1 <- tune.splsda(x_train,
+                              y_train,
+                              ncomp = choice.ncomp,
+                              validation = 'Mfold',
+                              folds = 3,
+                              dist = 'max.dist',
+                              progressBar = FALSE,
+                              measure = "overall",
+                              test.keepX = keepXlist,
+                              nrepeat = 50)   
+tictoc::toc()
+# 10432.16 sec elapsed
+
+gc()
+
+choice.ncomp <- tune.splsda.v1$choice.ncomp$ncomp # optimal number of components based on t-tests on the error rate
+choice.ncomp # 1
+
+choice.keepX <- tune.splsda.v1$choice.keepX[1:choice.ncomp] # optimal number of variables to select
+choice.keepX # comp1 90
+
+tune.splsda.v1$error.rate # globally assess how the classification error changes with different components, components 2, 3, and 4 don't seem to significantly decrease the classification error rate compared to component 1 - in other words, introducing more components in the model does not decrease the error rate
+
+plot(tune.splsda.v1, sd=T, col = color.jet(4))
+
+
+## tune a tentatively final model (i may try a different grid for the keepX values, but need to build this one to test it for now)
+
+set.seed(2022)
+
+tic()
+splsda.v1 <- splsda(x_train,
+                    y_train,
+                    ncomp = choice.ncomp,
+                    keepX = choice.keepX)
+toc() # 2.5 sec elapsed
+
+## cannot do component bi-plots because there is only 1 component
+
+png(here::here("Output", "2022_Manuscript", "02_Cross-Validation", "01_CVRound1_V1Model_SamplePlot.png"),
+    width = 2000,
+    height = 1500,
+    res = 200)
+
+plotIndiv(splsda.v1, comp =c(1,1),
+          col = c("#E69F00", "#999999"),
+          ind.names=FALSE,
+          ellipse=TRUE,
+          legend=TRUE,
+          title ='sPLS-DA comp 1 - 1')
+
+dev.off()
+
+## plots of variables that contribute to each component
+# all cpgs are associated with Non-PE Preterm (their DNAme is higher in this class than in EOPE)
+
+png(here::here("Output", "2022_Manuscript", "02_Cross-Validation", "01_CVRound1_V1Model_VariablePlot.png"),
+    width = 2000,
+    height = 1500,
+    res = 200)
+
+plotLoadings(splsda.v1, 
+             legend.color = c("#E69F00", "#999999"),
+             comp = 1, 
+             title = 'Contribution of CpG sites to Component 1',
+             contrib = 'max', 
+             method = 'mean',
+             xlim = c(-0.30, 0))
+
+dev.off()
+
+## auroc
+
+png(here::here("Output", "2022_Manuscript", "02_Cross-Validation", "01_CVRound1_V1Model_AUROC.png"),
+    width = 2000,
+    height = 1500,
+    res = 200)
+
+auroc.splsda.v1 <- auroc(splsda.v1,
+                         roc.comp = 1,
+                         print = FALSE)
+
+dev.off()
+
+auroc.splsda.v1$Comp1 # 0.971
+
+
+## check stability of features
+# form new perf() object which utilizes the final model
+
+tic()
+perf.splsda.v1 <- perf(splsda.v1,
+                       folds = 3,
+                       nrepeat = 50, # use repeated cross-validation
+                       validation = "Mfold",
+                       dist = "max.dist",  # use max.dist measure
+                       progressBar = FALSE)
+toc() # 465.51 sec elapsed
+
+gc()
+
+perf.splsda.v1$error.rate # 0.10 
+perf.splsda.v1$error.rate.sd # small SD
+perf.splsda.v1$error.rate.class # higher error rate for EOPE
+
+# plot the stability of each feature for the two components
+
+comp1_stable.v1 <- as.data.frame(perf.splsda.v1$features$stable[[1]])
+
+ggplot(comp1_stable.v1[1:90,]) +
+  geom_bar(aes(x = Var1, y = Freq), stat = "identity", fill = "#D5B895") +
+  xlab("Features") +
+  ylab("Stability") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0,1), expand = c(0, 0)) +
+  ggtitle("Stability of Component 1 Features on Cross-Validation")
+
+ggsave(here::here("Output", "2022_Manuscript", "02_Cross-Validation", "01_CVRound1_FeatureStability.png"),
+       width = 10,
+       height = 4)
+
+# taken from multivariate book
+predictors.v1 <-selectVar(splsda.v1,comp =1)$name
+predictors.v1.info <-
+probeInfo %>%
+  filter(probeID %in% predictors.v1) %>%
+  dplyr::select(probeID, chr, UCSC_RefGene_Name, UCSC_RefGene_Group, pos)
+predictors.v1.info
+
+# then extract the stability values from perf
+stability <- as.data.frame(perf.splsda.v1$features$stable$comp1[predictors.v1])
+stability$probeID <- stability$Var1
+stability$Var1 <- NULL
+head(stability)
+
+# merge with predictor info
+predictors.v1.info <- merge(predictors.v1.info, stability, by = "probeID")
+head(predictors.v1.info)
+
+# add loading values
+loadings <- as.data.frame(selectVar(splsda.v1,comp =1)$value)
+loadings$probeID <- rownames(loadings)
+rownames(loadings) <- NULL
+head(loadings)
+
+# join with predictor info
+predictors.v1.info <- merge(predictors.v1.info, loadings, by = "probeID")
+head(predictors.v1.info)
+
+# tidy
+predictors.v1.info$Loading_Val <- predictors.v1.info$value.var
+predictors.v1.info$value.var <- NULL
+predictors.v1.info$Freq_Stability <- predictors.v1.info$Freq
+predictors.v1.info$Freq <- NULL
+
+predictors.v1.info <- dplyr::select(predictors.v1.info, c(probeID, Freq_Stability, Loading_Val, chr, UCSC_RefGene_Name, UCSC_RefGene_Group, pos))
+head(predictors.v1.info)
+predictors.v1.info <- arrange(predictors.v1.info, desc(Freq_Stability)) # it does seem that the most stable features contribute more to the classification
+
+write.csv(predictors.v1.info, here::here("Output", "2022_Manuscript", "02_Cross-Validation", "01_CVRound1_Predictors.csv"))
+
+```
+
+The first round of CV selected ONE components with 90 features. Albeit this model seems to perform really well, with a low misclassification error rate and a ROC of 0.971, it seems that 90 features are probably more cpgs than what we need to discriminate EOPE from nPTB samples. In addition, the stability of some features is quite low (freq < 0.5), which suggests to me that certain features may be overfit to certain splits of the training data and not as generalizable. I want to see if somewhat arbitrarily reducing the number of features significantly decreases performance.
+
+```{r training round 2}
+
+predictors.v1.info %>%
+  filter(Freq_Stability > 0.6) # 44 features that are selected at least in 60% of the CV folds - this seems reasonable
+
+# try training a model with only 44 features and compare the performance with CV to the previous model
+
+set.seed(2022)
+tic()
+splsda.v2 <- splsda(x_train,
+                    y_train,
+                    ncomp = 1,
+                    keepX = 44)
+toc()
+
+gc()
+
+## SAMPLE PLOT
+png(here::here("Output", "2022_Manuscript", "02_Cross-Validation", "02_CVRound2_V2Model_SamplePlot.png"),
+    width = 2000,
+    height = 1500,
+    res = 200)
+
+plotIndiv(splsda.v2, comp =c(1,1),
+          col = c("#E69F00", "#999999"),
+          ind.names=FALSE,
+          ellipse=TRUE,
+          legend=TRUE,
+          title ='sPLS-DA comp 1 - 1')
+
+dev.off()
+
+## VARIABLE PLOT of variables that contribute to each component
+# all cpgs are associated with nPTB (their DNAme is higher in this class than in EOPE)
+
+png(here::here("Output", "2022_Manuscript", "02_Cross-Validation", "02_CVRound2_V2Model_VariablePlot.png"),
+    width = 2000,
+    height = 1500,
+    res = 200)
+
+plotLoadings(splsda.v2, 
+             legend.color = c("#E69F00", "#999999"),
+             comp = 1, 
+             title = 'Contribution of CpG sites to Component 1',
+             contrib = 'max', 
+             method = 'mean',
+             xlim = c(-0.4, 0))
+
+dev.off()
+
+## auroc
+png(here::here("Output", "2022_Manuscript", "02_Cross-Validation", "02_CVRound2_V2Model_AUROC.png"),
+    width = 2000,
+    height = 1500,
+    res = 200)
+
+auroc.splsda.v2 <- auroc(splsda.v2,
+                         roc.comp = 1,
+                         print = FALSE)
+
+dev.off()
+
+auroc.splsda.v2$Comp1 # 0.972
+
+gc()
+
+# now, assess performance of this model using CV
+
+tic()
+perf.splsda.v2 <- perf(splsda.v2,
+                       folds = 3,
+                       nrepeat = 50, # use repeated cross-validation
+                       validation = "Mfold",
+                       dist = "max.dist",  # use max.dist measure
+                       progressBar = FALSE)
+toc() # 456.41 sec elapsed
+
+gc()
+
+perf.splsda.v2$error.rate # 0.11 
+perf.splsda.v2$error.rate.sd # small 
+perf.splsda.v2$error.rate.class # higher error rate for EOPE
+
+# plot the stability of each feature for the two components
+
+comp1_stable.v2 <- as.data.frame(perf.splsda.v2$features$stable[[1]])
+
+ggplot(comp1_stable.v2[1:44,]) +
+  geom_bar(aes(x = Var1, y = Freq), stat = "identity", fill = "#D5B895") +
+  xlab("Features") +
+  ylab("Stability") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0,1), expand = c(0, 0)) +
+  ggtitle("Stability of Component 1 Features on Cross-Validation")
+
+ggsave(here::here("Output", "2022_Manuscript", "02_Cross-Validation", "02_CVRound2_FeatureStability.png"),
+       width = 10,
+       height = 4)
+
+# taken from multivariate book
+predictors.v2 <-selectVar(splsda.v2,comp =1)$name
+predictors.v2.info <-
+probeInfo %>%
+  filter(probeID %in% predictors.v2) %>%
+  dplyr::select(probeID, chr, UCSC_RefGene_Name, UCSC_RefGene_Group, pos)
+predictors.v2.info
+
+# then extract the stability values from perf
+stability <- as.data.frame(perf.splsda.v2$features$stable$comp1[predictors.v2])
+stability$probeID <- stability$Var1
+stability$Var1 <- NULL
+head(stability)
+
+# merge with predictor info
+predictors.v2.info <- merge(predictors.v2.info, stability, by = "probeID")
+head(predictors.v2.info)
+
+# add loading values
+loadings <- as.data.frame(selectVar(splsda.v2,comp =1)$value)
+loadings$probeID <- rownames(loadings)
+rownames(loadings) <- NULL
+head(loadings)
+
+# join with predictor info
+predictors.v2.info <- merge(predictors.v2.info, loadings, by = "probeID")
+head(predictors.v2.info)
+
+# tidy
+predictors.v2.info$Loading_Val <- predictors.v2.info$value.var
+predictors.v2.info$value.var <- NULL
+predictors.v2.info$Freq_Stability <- predictors.v2.info$Freq
+predictors.v2.info$Freq <- NULL
+
+predictors.v2.info <- dplyr::select(predictors.v2.info, c(probeID, Freq_Stability, Loading_Val, chr, UCSC_RefGene_Name, UCSC_RefGene_Group, pos))
+head(predictors.v2.info)
+predictors.v2.info <- arrange(predictors.v2.info, desc(Freq_Stability)) # it does seem that the most stable features contribute more to the classification
+
+write.csv(predictors.v2.info, here::here("Output", "2022_Manuscript", "02_Cross-Validation", "02_CVRound2_Predictors.csv"))
+
+saveRDS(splsda.v2, here("Data", "03_Predictor", "eoPred.rds"))
+
+```
+
+In the chunk below, I test out the 2 models on the training data.
+
+```{r predict on training}
+
+# train - model 1
+predict.splsda.train <- predict(splsda.v1,
+                                x_train,
+                                dist = "max.dist")
+
+table(factor(predict.splsda.train$class$max.dist[,1], levels = levels(y_train)), y_train) # 3 misclassifications on EOPE, and 2 on nPTB
+
+# train - model 2
+predict.splsda.train <- predict(splsda.v2,
+                                x_train,
+                                dist = "max.dist")
+
+table(factor(predict.splsda.train$class$max.dist[,1], levels = levels(y_train)), y_train) # 3 misclassifications on EOPE, and 2 on nPTB
+
+# so, at least on the training data they have the exact same performance with less features
+
+classProbs <- predict.splsda.train$predict[,,1]
+
+classProbs <- t(apply(as.matrix(classProbs), 1, function(data) exp(data)/sum(exp(data))))
+
+classProbs <- as.data.frame(classProbs) %>% rownames_to_column("Sample_ID")
+
+classProbs <- classProbs %>%
+  mutate(Class = case_when(`EOPE` > `Non-PE Preterm` ~ "EOPE",
+                           `EOPE` < `Non-PE Preterm` ~ "Non-PE Preterm"))
+
+ggplot(classProbs, aes(x = `EOPE`, y = `Non-PE Preterm`, color = Class)) +
+  geom_point(size = 1.5, shape = 19) +
+  scale_color_manual(values=c("#999999", "#E69F00")) +
+  xlab("Probability of EOPE") +
+  ylab("Probability of Non-PE Preterm") +
+  ggtitle("Class Probabilities of sPLS-DA Model") +
+  theme_minimal()
+
+```
+

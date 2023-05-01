@@ -1,0 +1,529 @@
+---
+title: "Testing that the performance of the model is better than by chance by using a model with permuted labels"
+author: "Icíar Fernández Boyano"
+date: "Originally written on June 26th, 2022 - Updated on October 27th, 2022"
+subtitle: "Last sanity check + knit on March 2023"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo 
+editor_options: 
+  chunk_output_type: console
+---
+
+# 1.0 Introduction
+
+In this script, I will be building a model with permuted class labels, with the idea that the actual model should at the very least perform better than this one. I am following the code on [this case study](http://mixomics.org/case-studies/srbct-spls-da-case-study-permuted-labels/), which does exactly that. 
+
+Prior to building the model, I will randomly permute the class labels such that the proportions of each class are maintained, but the instances that they are associated with are different. Quoting directly from the case study, this is done to simulate a scenario where the distinction between the provided classes is minimal and/or the data are quite noisy.
+
+Taken from the case study: 
+
+- sPLS-DA is fairly ineffective when looking at classes defined by linear or non-linear relationships. It is effective when the classes cluster according to a set of “signal” features, even in the presence of large quantities of noise attributes.
+
+- Rather than undergoing the entire tuning process again, the optimal values yielded from the sPLS-DA SRBCT Case Study will be used here – they can be seen directly below. Using these values, the sPLS-DA model can be constructed.
+
+```{r}
+
+library(tidyverse)
+library(mixOmics)
+library(caret)
+library(MLmetrics)
+library(here)
+library(tictoc)
+library(doParallel)
+library(impute)
+library(sva)
+library(missMethyl)
+library(janitor)
+library(factoextra)
+library(plomics)
+library(tidyr)
+library(ENmix)
+library(ggpubr)
+
+# PROBE INFO
+
+probeInfo <- cbind(IlluminaHumanMethylation450kanno.ilmn12.hg19::Locations,
+                   IlluminaHumanMethylation450kanno.ilmn12.hg19::Manifest,
+                      IlluminaHumanMethylation450kanno.ilmn12.hg19::Other) %>% as.data.frame()
+
+probeInfo <- rownames_to_column(probeInfo, var="probeID")
+
+chrXY <- probeInfo %>% filter(chr %in% c("chrX", "chrY"))
+chrX <- probeInfo %>% filter(chr %in% c("chrX"))
+chrY <- probeInfo %>% filter(chr %in% c("chrY"))
+
+# OBJECTS
+
+x_train <- readRDS(here("Data", "03_Predictor", "x_train.rds"))
+y_train <- readRDS(here("Data", "03_Predictor", "y_train.rds"))
+trainMeta <- read.csv(here("Data", "03_Predictor", "trainMeta.csv"))
+
+```
+
+# 2.0 Permute labels
+
+```{r permute labels}
+
+y_train # print to screen
+
+set.seed(2022)
+y_train_permuted <- sample(y_train)
+
+y_train_permuted # print shuffled data
+
+```
+
+# 3.0 Build model
+
+```{r build models}
+
+set.seed(2022)
+
+tic()
+mod.perm <- mixOmics::splsda(x_train,
+                             y_train_permuted,
+                             ncomp = 1,
+                             keepX = 45)
+toc() # 4.1 sex elapsed
+
+set.seed(2022)
+
+tic()
+mod <- mixOmics::splsda(x_train,
+                        y_train,
+                        ncomp = 1,
+                        keepX = 45)
+toc() # 2.44 sec elapsed
+
+```
+
+# 4.0 Cross-validation
+
+## 4.1 Setup
+
+```{r cv setup}
+
+## run perf ##
+
+set.seed(2022)
+tic()
+perf <- perf(mod,
+             folds = 3,
+             nrepeat = 50, # use repeated cross-validation
+             validation = "Mfold",
+             dist = "max.dist",  # use max.dist measure
+             auc=TRUE,
+             progressBar = FALSE)
+toc() # 463.74 sec elapsed
+
+set.seed(2022)
+tic()
+perf.perm <- perf(mod.perm,
+             folds = 3,
+             nrepeat = 50, # use repeated cross-validation
+             validation = "Mfold",
+             dist = "max.dist",  # use max.dist measure
+             auc=TRUE,
+             progressBar = FALSE)
+toc() # 2255.66 sec elapsed
+
+```
+
+## 4.2 Assess performance
+
+### 4.2.1 General
+
+```{r cv assess general}
+
+# calculate precision (true positives/(true positives + false positives)) for each rep and then average it across all reps to get an average precision for all CV 
+dim(trueClass <- trainMeta %>% dplyr::select(Sample_ID, Class)) # true class of samples, 83 samples
+
+dim(modClass <- as.data.frame(perf$class)) # 83 samples by 50 repeats
+dim(modClass.perm <- as.data.frame(perf.perm$class)) # 83 samples by 50 repeats
+
+all(trueClass$Sample_ID == rownames(modClass)) # TRUE
+all(trueClass$Sample_ID == rownames(modClass.perm)) # TRUE
+# okay great, they are in the same order
+
+# create vectors with the class predictions and the true class
+trueClass.v <- as.vector(trueClass$Class)
+modClass.v <- lapply(modClass, c)
+modClass.perm.v <- lapply(modClass.perm, c)
+
+# create confusion matrices that automatically calculate several metrics with caret's confusionMatrix function
+length(modClass.cm <- lapply(modClass.v, function(x) confusionMatrix(data=as.factor(x), reference=as.factor(trueClass.v)))) # 50, makes sense - one confusion matrix per repeat
+length(modClass.perm.cm <- lapply(modClass.perm.v, function(x) confusionMatrix(data=as.factor(x), reference=as.factor(trueClass.v)))) # 50, also makes sense!
+
+modClass.cm$max.dist.nrep1.comp1$byClass
+
+### sensitivity
+modClass.sens <- lapply(modClass.cm, function(x) x$byClass['Sensitivity']) %>% as.data.frame()
+rowMeans(modClass.sens) # 0.87
+
+modClass.perm.sens <- lapply(modClass.perm.cm, function(x) x$byClass['Sensitivity']) %>% as.data.frame()
+rowMeans(modClass.perm.sens) # 0.49
+
+### specificity
+modClass.spec <- lapply(modClass.cm, function(x) x$byClass['Specificity']) %>% as.data.frame()
+rowMeans(modClass.spec) # 0.92
+
+modClass.perm.spec <- lapply(modClass.perm.cm, function(x) x$byClass['Specificity']) %>% as.data.frame()
+rowMeans(modClass.perm.spec) # 0.46
+
+### precision
+modClass.prec <- lapply(modClass.cm, function(x) x$byClass['Precision']) %>% as.data.frame()
+rowMeans(modClass.prec) # 0.92
+
+modClass.perm.prec <- lapply(modClass.perm.cm, function(x) x$byClass['Precision']) %>% as.data.frame()
+rowMeans(modClass.perm.prec) # 0.48
+
+### recall
+modClass.recall <- lapply(modClass.cm, function(x) x$byClass['Recall']) %>% as.data.frame()
+rowMeans(modClass.recall) # 0.87
+
+modClass.perm.recall <- lapply(modClass.perm.cm, function(x) x$byClass['Recall']) %>% as.data.frame()
+rowMeans(modClass.perm.recall) # 0.49
+
+### F1
+modClass.F1 <- lapply(modClass.cm, function(x) x$byClass['F1']) %>% as.data.frame()
+rowMeans(modClass.F1) # 0.89
+
+modClass.perm.F1 <- lapply(modClass.perm.cm, function(x) x$byClass['F1']) %>% as.data.frame()
+rowMeans(modClass.perm.F1) # 0.48
+
+## TABLE ##
+
+#              Normal Model      Permuted Model
+# Error rate           0.11                0.54
+# Sensitivity          0.87                0.49
+# Specificity          0.92                0.46
+# Precision            0.92                0.48
+# Recall               0.87                0.49
+# F1                   0.89                0.48
+
+```
+
+### 4.2.2 Error rates
+
+```{r cv assess error rates}
+
+# ERROR RATES
+
+### error rate is 1-accuracy, roughly means % of wrong answers (% of times a sample was EOPE & was classified as nPTB)
+perf$error.rate # 0.11
+perf.perm$error.rate # 0.54
+
+error_rate <- data.frame(Model = c("Final Model (45 CpGs)", "Permuted Model (45 CpGs)"),
+                 ER = c(perf$error.rate$overall[1], 
+                        perf.perm$error.rate$overall[1]),
+                 ER_SD = c(perf$error.rate.sd$overall[1], 
+                           perf.perm$error.rate.sd$overall[1]),
+                 ER_EOPE = c(perf$error.rate.class$max.dist[1], 
+                             perf.perm$error.rate.class$max.dist[1]),
+                 ER_nPTB = c(perf$error.rate.class$max.dist[2], 
+                             perf.perm$error.rate.class$max.dist[2]))
+
+write.csv(error_rate, here("Output", "2022_Manuscript", "04_PermutedModel", "00_ErrorRates.csv"))
+
+plot_error_rate <-
+error_rate %>%
+  pivot_longer(!c(Model, ER, ER_SD), names_to = "Class", values_to = "Error Rate") %>%
+  mutate(Class = case_when(Class == "ER_EOPE" ~ "EOPE",
+                           Class == "ER_nPTB" ~ "Non-PE Preterm")) %>%
+  mutate(paired = rep(1:(n()/2),each=2),
+         Class=factor(Class))
+
+ggplot(plot_error_rate, aes(x=factor(Model, level=c("Final Model (45 CpGs)", "Permuted Model (45 CpGs)")), y=`Error Rate`))  +
+  geom_line(aes(group=paired))+
+  geom_point(aes(color=Class), size=4) +
+  scale_color_manual(values=c("#E69F00", "#999999")) +
+  coord_flip() +
+  ylim(c(0,0.20)) +
+  ylab("Mean Squared Error Rate") +
+  xlab("Model") +
+  theme_minimal() # not significant
+
+res_aov <- aov(`Error Rate` ~ Model, data=plot_error_rate)
+summary(res_aov) # confirmed
+
+ggsave(here::here("Output", "2022_Manuscript", "04_PermutedModel", "00_ErrorRates.png"),
+       width = 9,
+       height = 3)
+
+```
+
+### 4.2.3 Feature stability
+
+```{r cv assess feature stability}
+
+# FEATURE STABILITY
+
+# mod 1 - final model
+preds.final <- selectVar(mod)$name
+stab.final <- as.data.frame(perf$features$stable$comp1[preds.final])
+
+plot_stab <- function(data, model_name){
+  ggplot(data) +
+  geom_bar(aes(x = Var1, y = Freq), stat = "identity", fill = "#D5B895") +
+  xlab("Features") +
+  ylab("Stability") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0,1), expand = c(0, 0)) +
+  ggtitle(paste0("Stability of ", model_name, " on Cross-Validation"))
+}
+
+plot_stab(stab.final, "Final 45 CpG probe model")
+
+ggsave(here::here("Output", "2022_Manuscript", "04_PermutedModel", "01_1_FeatureStability_Final.png"),
+       width = 10,
+       height = 4)
+
+# mod 2 - permuted
+preds.permuted <- selectVar(mod.perm)$name
+stab.perm <- as.data.frame(perf.perm$features$stable$comp1[preds.permuted])
+
+plot_stab(stab.perm, "Permuted 45 CpG probe model")
+
+ggsave(here::here("Output", "2022_Manuscript", "04_PermutedModel", "01_2_FeatureStability_Permuted.png"),
+       width = 10,
+       height = 4)
+
+# numbers
+
+get_pred_info <- function(predictor_names, perf_object, model_object){
+  probe_info <- probeInfo %>% filter(probeID %in% predictor_names) %>% dplyr::select(probeID, chr, UCSC_RefGene_Name, UCSC_RefGene_Group, pos)
+  # then extract the stability values from perf
+  stability <- as.data.frame(perf_object$features$stable$comp1[probe_info$probeID])
+  stability$probeID <- stability$Var1
+  stability$Var1 <- NULL
+  # merge with predictor info
+  probe_info <- merge(probe_info, stability, by = "probeID")
+  # add loading values
+  loadings <- as.data.frame(selectVar(model_object,comp =1)$value)
+  loadings$probeID <- rownames(loadings)
+  rownames(loadings) <- NULL
+  # join with predictor info
+  probe_info <- merge(probe_info, loadings, by = "probeID")
+  # tidy
+  probe_info$Loading_Val <- probe_info$value.var
+  probe_info$value.var <- NULL
+  probe_info$Freq_Stability <- probe_info$Freq
+  probe_info$Freq <- NULL
+  probe_info <- dplyr::select(probe_info, c(probeID, Freq_Stability, Loading_Val, chr, UCSC_RefGene_Name, UCSC_RefGene_Group, pos))
+  probe_info <- arrange(probe_info, desc(Freq_Stability))
+  probe_info
+}
+
+## mod 1 - final ##
+preds.final <- get_pred_info(preds.final, perf, mod)
+print(preds.final)
+write.csv(preds.final, here::here("Output", "2022_Manuscript", "04_PermutedModel", "02_1_Predictors_Final.csv"))
+
+## mod 2 - permuted ##
+preds.permuted <- get_pred_info(preds.permuted, perf.perm, mod.perm)
+print(preds.permuted)
+write.csv(preds.permuted, here::here("Output", "2022_Manuscript", "04_PermutedModel", "02_2_Predictors_Permuted.csv"))
+
+```
+
+### 4.2.4 ROC/AUC, Precision-Recall, and Lift Curves
+
+```{r cv assess continued}
+
+# AUC
+# https://cran.rstudio.com/web/packages/ROCR/vignettes/ROCR.html
+
+auc <- data.frame(Model = c("Final Model (45 CpGs)", "Permuted Model (45 CpGs)"),
+                 AUC = c(perf$auc$comp1[[1]], 
+                        perf.perm$auc$comp1[[1]]))
+
+head(auc)
+
+write.csv(auc, here::here("Output", "2022_Manuscript", "04_PermutedModel", "03_AUC.csv"))
+
+getCP <- function(predict.output, metadata){
+  CP <- predict.output$predict[,,1]
+  CP <- t(apply(as.matrix(CP), 1, function(data) exp(data)/sum(exp(data))))
+  CP <- as.data.frame(CP) %>% rownames_to_column("Sample_ID")
+  CP$Pred_Class <- CP$comp1
+  CP$True_Class <- metadata$Condition
+  CP <- CP %>%
+  mutate(Pred_Class_Probs = case_when(EOPE > `Non-PE Preterm` ~ "EOPE",
+                                      EOPE < `Non-PE Preterm` ~ "Non-PE Preterm"))
+  CP
+}
+
+# average all predictions from each of the 50 CV folds
+getAvPred <- function(perf_object){
+  y <- perf_object$predict$comp1
+  z <- lapply(seq(dim(y)[3]), function(x) y[ , , x])
+  z <- do.call(cbind.data.frame, z)
+  nms <- unique(names(z))
+  z <- sapply(nms, function(x) rowMeans(z[names(z) %in% x]))
+  z <- t(apply(as.matrix(z), 1, function(data) exp(data)/sum(exp(data))))
+  z <- as.data.frame(z) %>% mutate(Sample_ID = rownames(z))
+  z <- z %>% mutate(PredClass = case_when(EOPE > `Non-PE Preterm` ~ "EOPE",
+                                          EOPE < `Non-PE Preterm` ~ "Non-PE Preterm"))
+  metadata <- trainMeta %>% dplyr::select(Sample_ID, Class)
+  mz <- left_join(metadata, z, by="Sample_ID")
+  mz <- mz %>% mutate(True = case_when(Class == "Non-PE Preterm" ~ 0,
+                                       Class == "EOPE" ~ 1))
+}
+
+
+list <- list(mod = perf,
+             mod.perm = perf.perm)
+
+avpreds <- lapply(list, getAvPred)
+
+library(ROCR)
+library(ggsci)
+library(MLmetrics)
+
+preds <- cbind(mod = avpreds$mod$EOPE,
+               mod.perm = avpreds$mod.perm$EOPE)
+
+auc_mlmetrics <- sapply(as.data.frame(preds), function(x) MLmetrics::Area_Under_Curve(x, avpreds$mod$True))
+print(auc_mlmetrics)
+
+pred.mat <- prediction(preds, 
+                       labels = matrix(avpreds$mod$True, # all are the same 
+                                       nrow = length(avpreds$mod$True), ncol = 2))
+
+perf.mat <- performance(pred.mat, "tpr", "fpr")
+
+df <- data.frame(Curve=as.factor(rep(c(1,2), each=length(perf.mat@x.values[[1]]))), 
+                 FalsePositive=c(perf.mat@x.values[[1]],
+                                 perf.mat@x.values[[2]]),
+                 TruePositive=c(perf.mat@y.values[[1]],
+                                perf.mat@y.values[[2]]))
+
+
+ggplot() + 
+  geom_line(data=as.data.frame(df %>% filter(Curve==1)),
+            aes(x=FalsePositive, y=TruePositive, color=Curve), size=1.5, alpha=0.4)+
+  geom_line(data=as.data.frame(df %>% filter(Curve==2)), 
+            aes(x=FalsePositive, y=TruePositive, color=Curve), size=1.5, alpha=0.4) +
+  scale_colour_npg(labels=c("Final Model", 
+                               "Permuted Model")) +
+  xlab("Average false positive rate") +
+  ylab("Average true positive rate") +
+  labs(col="Model") +
+  theme_minimal() +
+  labs(title= "Receiver Operating Characteristic Curve",
+       subtitle="Average ROC for repeated (n=50) 3-fold CV for each model")
+
+ggsave(here::here("Output", "2022_Manuscript", "04_PermutedModel",
+                  "03_ROC_Curves.png"),
+       width = 5,
+       height = 4)
+
+# PRECISION-RECALL
+
+avpreds <- lapply(avpreds, function(x) dplyr::mutate(x, Pred = case_when(PredClass == "Non-PE Preterm" ~ 0,
+                                                                         PredClass == "EOPE" ~ 1)))
+
+discrete_preds <- cbind(mod = avpreds$mod$Pred,
+                        mod.perm = avpreds$mod.perm$Pred)
+
+precision <- sapply(as.data.frame(discrete_preds), function(x) MLmetrics::Precision(x, avpreds$mod$True))
+recall <- sapply(as.data.frame(discrete_preds), function(x) MLmetrics::Recall(x, avpreds$mod$True))
+f1 <- sapply(as.data.frame(discrete_preds), function(x) MLmetrics::F1_Score(x, avpreds$mod$True))
+sens <- sapply(as.data.frame(discrete_preds), function(x) MLmetrics::Sensitivity(x, avpreds$mod$True))
+spec <- sapply(as.data.frame(discrete_preds), function(x) MLmetrics::Specificity(x, avpreds$mod$True))
+
+print(precision)
+print(recall)
+print(f1)
+print(sens)
+print(spec)
+
+perf.mat <- performance(pred.mat, "prec", "rec")
+
+df <- data.frame(Curve=as.factor(rep(c(1,2), each=length(perf.mat@x.values[[1]]))), 
+                 Precision=c(perf.mat@x.values[[1]],
+                                 perf.mat@x.values[[2]]),
+                 Recall=c(perf.mat@y.values[[1]],
+                                perf.mat@y.values[[2]]))
+
+ggplot() + 
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==1)),
+            aes(x=Recall, y=Precision, color=Curve), size=1, alpha=0.4, se=F)+
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==2)), 
+            aes(x=Recall, y=Precision, color=Curve), size=1, alpha=0.4, se=F) +
+  scale_colour_npg(labels=c("Final Model", 
+                               "Permuted Model")) +
+  xlab("Average recall") +
+  ylab("Average precision") +
+  labs(col="Model") +
+  theme_minimal() +
+  labs(title= "Precision-Recall Curve",
+       subtitle="Average PR for repeated (n=50) 3-fold CV for each model")
+
+ggsave(here::here("Output", "2022_Manuscript", "04_PermutedModel",
+                  "03_PrecisionRecall_Curve.png"),
+       width = 5,
+       height = 4)
+
+# LIFT-RPP
+
+lift_auc <- sapply(as.data.frame(preds), function(x) MLmetrics::LiftAUC(x, avpreds$mod$True))
+print(lift_auc)
+
+log_loss <- sapply(as.data.frame(preds), function(x) MLmetrics::Poisson_LogLoss(x, avpreds$mod$True))
+print(log_loss)
+
+perf.mat <- performance(pred.mat, "lift", "rpp")
+
+df <- data.frame(Curve=as.factor(rep(c(1,2), each=length(perf.mat@x.values[[1]]))), 
+                 Lift=c(perf.mat@x.values[[1]],
+                                 perf.mat@x.values[[2]]),
+                 RPP=c(perf.mat@y.values[[1]],
+                                perf.mat@y.values[[2]]))
+
+ggplot() + 
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==1)),
+            aes(x=RPP, y=Lift, color=Curve), size=1, alpha=0.4, se=F)+
+  geom_smooth(data=as.data.frame(df %>% filter(Curve==2)), 
+            aes(x=RPP, y=Lift, color=Curve), size=1, alpha=0.4, se=F) +
+  scale_colour_npg(labels=c("Final Model", 
+                               "Permuted Model")) +
+  xlab("Average rate of positive predictions") +
+  ylab("Average lift value") +
+  labs(col="Model") +
+  theme_minimal() +
+  labs(title= "Lift Chart",
+       subtitle="Average for repeated (n=50) 3-fold CV for each model")
+
+ggsave(here::here("Output", "2022_Manuscript", "04_PermutedModel",
+                  "03_Lift_Curve.png"),
+       width = 5,
+       height = 4)
+
+```
+
+
+
+
+
+
+### 4.2.5 Brier Score
+
+```{r}
+
+library(DescTools)
+
+brier <- data.frame(Model = c("Final Model (45 CpGs)", "Permuted Model (45 CpGs)"),
+                 BrierScore = c(BrierScore(as.numeric(pred.mat@labels[[1]]), pred.mat@predictions[[1]]), 
+                        BrierScore(as.numeric(pred.mat@labels[[1]]), pred.mat@predictions[[2]])))
+
+print(brier)
+
+write.csv(brier, here::here("Output", "2022_Manuscript", "04_PermutedModel", "04_BrierScores.csv"))
+
+```

@@ -1,0 +1,1817 @@
+---
+title: "Figures + Tables"
+author: "Icíar Fernández Boyano"
+date: "April 2023"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo 
+editor_options: 
+  chunk_output_type: console
+---
+
+**On the figures & tables not present in this script:**
+
+- Figure 1 was created in powerpoint
+
+- Figure 2 was created as part of the 01_1_Training.Rmd and 01_2_Training_MinimalModel.Rmd scripts, located in this same folder
+
+- Table 1 was created collecting demographic information from the QC scripts, in 01_Preprocessing/2022_Manuscript_Final_Scripts
+
+- Table 2 was generated as part of the 01_2_Training_MinimalModel.Rmd and 01_3_Training_PermutedModel.Rmd scripts, located in this same folder
+
+- Figure S1 was generated in the GA script in the preprocessing folder
+
+- Table S1 was generated in the GA script in the preprocessing folder
+
+- Table S2 was generated in the predictor analysis script in this folder
+
+# Setup
+
+```{r warning=FALSE, message=FALSE}
+
+library(tidyverse)
+library(mixOmics)
+library(here)
+library(tictoc)
+library(doParallel)
+library(impute)
+library(sva)
+library(missMethyl)
+library(janitor)
+library(factoextra)
+library(plomics)
+library(tidyr)
+library(ENmix)
+library(cvms)
+library(ROCR)
+library(ggsci)
+library(DescTools)
+library(MLmetrics)
+library(ENmix)
+library(caret)
+library(readxl)
+library(wateRmelon)
+library(planet)
+library(ggpubr)
+library(rstatix)
+library(ggridges)
+library(karyoploteR)
+library(AnnotationHub)
+
+# PROBE INFO
+
+probeInfo <- cbind(IlluminaHumanMethylation450kanno.ilmn12.hg19::Locations,
+                   IlluminaHumanMethylation450kanno.ilmn12.hg19::Manifest,
+                      IlluminaHumanMethylation450kanno.ilmn12.hg19::Other) %>% as.data.frame()
+
+probeInfo <- rownames_to_column(probeInfo, var="probeID")
+
+chrXY <- probeInfo %>% filter(chr %in% c("chrX", "chrY"))
+chrX <- probeInfo %>% filter(chr %in% c("chrX"))
+chrY <- probeInfo %>% filter(chr %in% c("chrY"))
+
+# OBJECTS
+
+complete_mset <- readRDS(here("Data", "01_Raw", "complete_mset.rds"))
+
+x_train <- readRDS(here("Data", "03_Predictor", "x_train.rds"))
+y_train <- readRDS(here("Data", "03_Predictor", "y_train.rds"))
+trainMeta <- read.csv(here("Data", "03_Predictor", "trainMeta.csv"))
+
+val <- readRDS(here("Data", "02_Processed", "valBMIQ.rds"))
+valMeta <- read.csv(here("Data", "02_Processed", "valMeta.csv"))
+val <- val[,colnames(val) %in% valMeta$Sample_ID]
+all(colnames(val) == valMeta$Sample_ID) # TRUE
+
+exp <- readRDS(here("Data", "02_Processed", "extBMIQ.rds"))
+expMeta <- read.csv(here("Data", "02_Processed", "extMeta.csv"))
+exp <- exp[,colnames(exp) %in% expMeta$Sample_ID]
+all(colnames(exp) == expMeta$Sample_ID) # TRUE
+
+cordblood <- readRDS(here("Data", "02_Processed", "GSE110829_QC_BMIQ_BC.rds"))
+cordblood_meta <- read.csv(here("Data", "02_Processed", "GSE110829_metadata.csv"))
+all(colnames(cordblood) == cordblood_meta$Sample_ID) # TRUE
+
+# MODEL
+set.seed(2022)
+
+tic()
+mod <- mixOmics::splsda(x_train,
+                        y_train,
+                        ncomp = 1,
+                        keepX = 45)
+toc() # 2.44 sec elapsed
+
+# predict preeclampsia function
+predictPreeclampsia <- function(betas, ...){
+
+  trainCpGs <- colnames(mod$X)
+  peCpGs <- mixOmics::selectVar(mod)$name
+  
+  # check that there are no NAs in the predictors (or if there are, how many)
+  pp <- intersect(colnames(betas), peCpGs)
+  
+  if(length(pp) < length(peCpGs)){
+    warning(paste(
+      "Only", length(pp), "out of 45 predictors present."
+    ))
+  } else {
+    message(paste(length(pp), "of 45 predictors present."))
+    message("BMIQ normalization is recommended for best results.")
+  }
+  
+  # set up data for prediction
+  
+  # if input data is missing any of the cpgs present in the training data, this function
+  # adds the ones that are missing as NAs
+  # necessary for `mixOmics::predict` to work
+  
+  outersect = function(x, y) {
+    sort(c(x[!x%in%y],
+           y[!y%in%x]))
+  }
+  
+  if(inherits(betas, 'matrix')){
+  } else if (inherits(betas, 'array')) {
+  } else {
+    
+    # throw an error
+    print(paste0("Input data must be a matrix or an array"))
+  }
+  
+  subset <- betas[,colnames(betas) %in% trainCpGs]
+  
+  # order
+  subset <- subset[drop=FALSE,, trainCpGs]
+  
+  if(all(colnames(subset) == trainCpGs) == FALSE){
+    stop()
+  } else
+    
+    # predict
+    out <- mixOmics:::predict.mixo_spls(mod, subset)
+  
+  # get class probabilities
+  CP <- out$predict[,,1]
+  CP <- t(apply(as.matrix(CP), 1, function(data) exp(data)/sum(exp(data))))
+  CP <- as.data.frame(CP) %>% tibble::rownames_to_column("Sample_ID")
+  CP$Pred_Class <- CP$comp1
+  CP <- CP %>%
+    dplyr::mutate(Pred_Class = dplyr::case_when(EOPE > `Non-PE Preterm` ~ "EOPE",
+                                                EOPE < `Non-PE Preterm` ~ "Normotensive"))
+  
+  return(CP)
+}
+
+```
+
+In this R Markdown, I take code from the other scripts in this folder and put it together to make some better figures for the paper after receiving feedback, since I prefer to leave the analysis scripts as they were.
+
+# Predict EOPE and cell composition
+
+## EOPE
+
+```{r}
+
+# predict
+valpreds <- predictPreeclampsia(t(val))
+exppreds <- predictPreeclampsia(t(exp))
+gc()
+
+# quick look
+head(valpreds)
+head(exppreds)
+
+# join with metadata
+valMeta <- left_join(valMeta, valpreds, by="Sample_ID")
+head(valMeta)
+expMeta <- left_join(expMeta, exppreds, by="Sample_ID")
+head(expMeta)
+
+# assess
+tabyl(valMeta, Class, Pred_Class) # 15 EOPE misclassified as normotensive
+tabyl(expMeta, Class, Pred_Class)
+
+```
+
+## Cell composition
+
+```{r}
+
+# calculate cell composition for all samples in all three cohorts
+data("plCellCpGsThird")
+data("plColors")
+head(plCellCpGsThird)
+
+cellcomp_val <-
+  minfi:::projectCellType(
+    
+    # subset your data to cell cpgs
+    val[rownames(plCellCpGsThird),], 
+    
+    # input the reference cpg matrix
+    plCellCpGsThird,
+    
+    lessThanOne = FALSE)
+
+cellcomp_val <- as.data.frame(cellcomp_val) %>% rownames_to_column("Sample_ID")
+head(cellcomp_val)
+valMeta <- left_join(valMeta, cellcomp_val, by="Sample_ID")
+head(valMeta)
+
+cellcomp_exp <-
+  minfi:::projectCellType(
+    
+    # subset your data to cell cpgs
+    exp[rownames(plCellCpGsThird),], 
+    
+    # input the reference cpg matrix
+    plCellCpGsThird,
+    
+    lessThanOne = FALSE)
+
+cellcomp_exp <- as.data.frame(cellcomp_exp) %>% rownames_to_column("Sample_ID")
+head(cellcomp_exp)
+expMeta <- left_join(expMeta, cellcomp_exp, by="Sample_ID")
+head(expMeta)
+
+dim(train <- complete_mset[,colnames(complete_mset) %in% trainMeta$Sample_ID])
+all(colnames(train) == trainMeta$Sample_ID) # TRUE
+
+set.seed(2022)
+tic()
+train <- wateRmelon::BMIQ(train)
+toc()
+
+cellcomp_train <-
+  minfi:::projectCellType(
+    
+    # subset your data to cell cpgs
+    train[rownames(plCellCpGsThird),], 
+    
+    # input the reference cpg matrix
+    plCellCpGsThird,
+    
+    lessThanOne = FALSE)
+
+cellcomp_train <- as.data.frame(cellcomp_train) %>% rownames_to_column("Sample_ID")
+head(cellcomp_train)
+trainMeta <- left_join(trainMeta, cellcomp_train, by="Sample_ID")
+head(trainMeta)
+
+```
+
+# Classification performance: probability & categorical predictions (Figure 3)
+
+```{r}
+
+dim(valMeta)
+dim(expMeta)
+
+dim(valMeta <- valMeta %>% dplyr::select(!c(Syncytiotrophoblast.x, Trophoblasts.x, Stromal.x, Hofbauer.x, Endothelial.x, nRBC.x,
+                                            meanSScor, FAIL_Intersample_Cor)) %>% dplyr::rename(Syncytiotrophoblast = Syncytiotrophoblast.y,
+                                                                                         Trophoblasts = Trophoblasts.y,
+                                                                                         Stromal = Stromal.y,
+                                                                                         Hofbauer = Hofbauer.y,
+                                                                                         Endothelial = Endothelial.y,
+                                                                                         nRBC = nRBC.y))
+
+dim(expMeta <- expMeta %>% dplyr::select(!c(Syncytiotrophoblast.x, Trophoblasts.x, Stromal.x, Hofbauer.x, Endothelial.x, nRBC.x,
+                                            meanSScor, FAIL_Intersample_Cor)) %>% dplyr::rename(Syncytiotrophoblast = Syncytiotrophoblast.y,
+                                                                                         Trophoblasts = Trophoblasts.y,
+                                                                                         Stromal = Stromal.y,
+                                                                                         Hofbauer = Hofbauer.y,
+                                                                                         Endothelial = Endothelial.y,
+                                                                                         nRBC = nRBC.y))
+
+all(colnames(valMeta) == colnames(expMeta)) # TRUE
+
+meta <- rbind(valMeta, expMeta)
+tabyl(meta, Class)
+
+meta <- meta %>% dplyr::select(!X.1)
+
+meta <- 
+meta %>%
+  mutate(Pred_Class = case_when(Pred_Class == "EOPE" ~ "EOPE",
+                                Pred_Class == "Normotensive" ~ "Non-PE Preterm"))
+
+# compare
+tabyl(meta, Class)
+
+meta <- meta %>% mutate(Group = case_when(Sample_ID %in% c(valMeta$Sample_ID)~ "Validation",
+                                          Sample_ID %in% c(expMeta$Sample_ID)~ "Exploratory"))
+
+tabyl(meta, Class, Group)
+
+meta <- meta %>% 
+  mutate(Pred_Class_60 = case_when(EOPE > 0.6 ~ "EOPE",
+                                   EOPE < 0.6 ~ "Non-PE Preterm"))
+
+tabyl(meta, Class, Pred_Class)
+tabyl(meta, Class, Pred_Class_60)
+
+meta %>% 
+  mutate(True_Class = factor(Class,
+                             levels=c("CPM16", "FGR", "LatePE", "Non-PE Term", "Non-PE Preterm", "EOPE"))) %>%
+  ggplot() +
+  geom_boxplot(aes(x = Class,
+                  y = EOPE),
+               width=0.3,
+               alpha=0.5,
+               color="darkgrey") +
+  geom_jitter(aes(x = Class,
+                  y = EOPE, 
+                  color = Pred_Class), 
+              alpha = 0.5, 
+              position = position_jitter(width = .1)) + 
+  coord_flip() +
+  ylab("Class Probability of EOPE") +
+  xlab("True Class") +
+  ylim(0,1) +
+  scale_color_manual(name = "Predicted Class", values=c("#E69F00", "#999999")) + 
+  theme_minimal() +
+  ggtitle("Probability of EOPE of Validation + Exploratory Groups (n=377)")
+
+meta %>% 
+  mutate(True_Class = factor(Class,
+                             levels=c("CPM16", "FGR", "LatePE", "Non-PE Term", "Non-PE Preterm", "EOPE"))) %>%
+  ggplot() +
+  geom_boxplot(aes(x = Class,
+                  y = EOPE),
+               width=0.3,
+               alpha=0.5,
+               color="darkgrey") +
+  geom_jitter(aes(x = Class,
+                  y = EOPE, 
+                  color = Pred_Class_60), 
+              alpha = 0.5, 
+              position = position_jitter(width = .1)) + 
+  coord_flip() +
+  ylab("Class Probability of EOPE") +
+  xlab("True Class") +
+  ylim(0,1) +
+  scale_color_manual(name = "Predicted Class", values=c("#E69F00", "#999999")) + 
+  theme_minimal() +
+  ggtitle("Probability of EOPE of Validation + Exploratory Groups (n=377)")
+
+```
+
+When I don't batch correct the data, there are several EOPE samples that are misclassified as nPTB. I want to further explore this and be straightforward about the issue in the paper.
+
+```{r}
+
+# nPTB samples
+dim(meta %>% filter(Class == "Non-PE Preterm") %>% filter(Group == "Validation")) # 11
+meta %>% filter(Class == "Non-PE Preterm" & Pred_Class == "EOPE") %>% filter(Group == "Validation") # nothing seems particularly special about these samples - 2/11 (84% specificity)
+meta %>% filter(Class == "Non-PE Preterm" & Pred_Class_60 == "EOPE") %>% filter(Group == "Validation") # nothing seems particularly special about these samples - 1/11 (91% specificity)
+
+# EOPE samples
+dim(meta %>% filter(Class == "EOPE") %>% filter(Group == "Validation")) # 38
+meta %>% filter(Group == "Validation") %>% filter(Class == "EOPE" & Pred_Class == "Non-PE Preterm") # all 15 samples are from GSE125605 :( all asian - 72% sensitivity
+meta %>% filter(Group == "Validation") %>% filter(Class == "EOPE" & Pred_Class_60 == "Non-PE Preterm") # 18 instead of 15 - 68% sensitivity
+
+tabyl(meta, Class, GEO_Dataset) # so, 15 out of the total 22 EOPE samples in that dataset got misclassified
+
+```
+
+Should I change the classification threshold to 60%?
+
+```{r}
+
+library(pROC)
+
+metaVAL <- meta %>% filter(Group == "Validation") %>% mutate(Class_Binary = case_when(Class == "EOPE" ~ 1,
+                                                                                      Class == "Non-PE Preterm" ~ 0))
+
+# create an roc object
+roc_obj <- roc(metaVAL$Class_Binary, metaVAL$EOPE)
+
+# review the roc object
+roc_obj
+
+png(here::here("Output", "2022_Manuscript", "Figure3A.png"), 
+    width = 1000, height = 1000,
+    pointsize = 12, bg = "transparent",
+    res=200)
+plot(roc_obj, print.thres="best", print.auc=TRUE, print.auc.x=1, print.auc.y=1, main="ROC Curve in Validation Group")
+dev.off()
+
+# get the "best" "threshold"
+# there are lots of other options for other metrics as well
+coords(roc_obj, "best", "threshold")
+
+# what does the ROC curve look like without GSE125605
+metaVAL_noGSE125605 <- meta %>% filter(Group == "Validation") %>% filter(!GEO_Dataset == "GSE125605")  %>% mutate(Class_Binary = case_when(Class == "EOPE" ~ 1,
+                                                                                                                                           Class == "Non-PE Preterm" ~ 0))
+
+roc_obj_2 <- roc(metaVAL_noGSE125605$Class_Binary, metaVAL_noGSE125605$EOPE)
+plot(roc_obj_2, print.thres="best", print.auc=TRUE, print.auc.x=1.05, print.auc.y=1, main="ROC Curve in Validation Group - Without GSE125605")
+
+coords(roc_obj_2, "best", "threshold")
+
+```
+
+The ideal threshold is suggested to be 0.5454187 according to the ROC curve, both when I look at it with and without GSE125605, which is the dataset that I am getting most misclassifications from. 15 out of the total 22 EOPE samples in GSE125605 were misclassified as nPTB. This suggests that ethnicity clearly has an effect on the predictor. Let's create a column that classifies samples based on that threshold, and generate a plot of probabilities again.
+
+```{r}
+
+meta <- meta %>% mutate(Pred_Class_Best = case_when(EOPE > 0.5454187 ~ "EOPE",
+                                                    EOPE < 0.5454187 ~ "Non-PE Preterm"))
+
+meta %>% 
+  mutate(True_Class = factor(Class,
+                             levels=c("CPM16", "FGR", "LatePE", "Non-PE Term", "Non-PE Preterm", "EOPE"))) %>%
+  ggplot() +
+  geom_boxplot(aes(x = True_Class,
+                  y = EOPE),
+               width=0.3,
+               alpha=0.5,
+               color="darkgrey") +
+  geom_jitter(aes(x = True_Class,
+                  y = EOPE, 
+                  color = Pred_Class_Best), 
+              alpha = 0.5, 
+              position = position_jitter(width = .1)) + 
+  coord_flip() +
+  ylab("Class Probability of EOPE") +
+  xlab("True Class") +
+  ylim(0,1) +
+  scale_color_manual(name = "Predicted Class", values=c("#E69F00", "#999999")) + 
+  theme_minimal() +
+  geom_hline(yintercept = 0.5454187, 
+             color = "#E69F00", size=1) +
+  ggtitle("Probability of EOPE of Validation + Exploratory Groups (n=377)")
+
+ggsave(file="Figure3B.png", 
+       width=10, height=3.5,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+
+tabyl(meta %>% filter(Class %in% c("EOPE", "Non-PE Preterm")), Class, Pred_Class_Best)
+
+```
+
+Now, I want to look at ethnicity more closely. 
+
+```{r}
+
+# plot average beta value at the 45 predictive CpGs in asian samples (>80%), african samples (>80%) and european samples (>80%)
+predictors <- selectVar(mod)$name
+
+dim(expPredictors <- exp[rownames(exp) %in% predictors,]) # 45 
+dim(valPredictors <- val[rownames(val) %in% predictors,]) # 45
+
+dim(long_expPredictors <- as.data.frame.table(expPredictors))
+dim(long_valPredictors <- as.data.frame.table(valPredictors))
+
+dim(long_predictors <- rbind(long_expPredictors, long_valPredictors))
+head(long_predictors)
+
+long_predictors <- long_predictors %>% mutate(cpg = Var1, Sample_ID = Var2, beta = Freq) %>% dplyr::select(!c(Var1, Var2, Freq))
+head(long_predictors)
+long_predictors <- left_join(long_predictors, meta, by="Sample_ID")
+head(long_predictors)
+
+# first, look at it just by class in the training set
+all(colnames(train) == trainMeta$Sample_ID) # TRUE
+dim(trainPredictors <- train[rownames(train) %in% predictors,]) # 45
+dim(long_trainPredictors <- as.data.frame.table(trainPredictors) %>% 
+      mutate(cpg = Var1, Sample_ID = Var2, beta = Freq) %>% dplyr::select(!c(Var1, Var2, Freq)))
+head(long_trainPredictors)
+dim(long_trainPredictors <- left_join(long_trainPredictors, trainMeta, by="Sample_ID"))
+head(long_trainPredictors)
+
+tabyl(trainMeta, Class)
+tabyl(trainMeta, Class, Predicted_ethnicity_nothresh)
+
+long_trainPredictors %>%
+  ggplot(aes(x=reorder(cpg, beta), y=beta, fill=Class, color=Class)) +
+  geom_boxplot(alpha=0.7) +
+  scale_fill_manual(name = "Class", values=c("#E69F00", "#999999")) +
+  scale_color_manual(name = "Class", values=c("#E69F00", "#999999")) +
+  theme_minimal() +
+  xlab("45 eoPred CpGs") +
+  ylab("\u03b2 value of 83 samples in the training group") +
+  stat_compare_means(label="p.signif") +
+  theme(axis.text.x = element_text(angle=45, hjust=1)) +
+  ggtitle("\u03b2 value of training samples at the 45 predictive CpGs")
+
+ggsave(file="FigureSupp_TrainingBValues.png", 
+       width=17.5, height=3.5,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+
+# now by ancestry
+long_trainPredictors %>%
+  mutate(Ancestry = case_when(Predicted_ethnicity_nothresh == "African" ~ "African (7 EOPE, 5 nPTB)",
+                              Predicted_ethnicity_nothresh == "Asian" ~ "Asian (7 EOPE, 6 nPTB)",
+                              Predicted_ethnicity_nothresh == "Caucasian" ~ "European (28 EOPE, 30 nPTB)")) %>%
+  ggplot(aes(x=reorder(cpg, beta), y=beta, fill=Class, color=Class)) +
+  geom_boxplot(alpha=0.7) +
+  scale_fill_manual(name = "Class", values=c("#E69F00", "#999999")) +
+  scale_color_manual(name = "Class", values=c("#E69F00", "#999999")) +
+  theme_minimal() +
+  facet_wrap(~Ancestry, ncol=1) +
+  xlab("45 eoPred CpGs") +
+  ylab("\u03b2 value of 83 samples in the training group") +
+  stat_compare_means(label="p.signif") +
+  theme(axis.text.x = element_text(angle=45, hjust=1)) +
+  ggtitle("\u03b2 value of training samples at the 45 predictive CpGs")
+
+ggsave(file="FigureSupp_TrainingBValues_byAncestry.png", 
+       width=17.5, height=8,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+
+# now in the validation
+tabyl(as.data.frame(meta %>% 
+                      filter(Class %in% c("EOPE", "Non-PE Preterm")) %>%
+                      filter(!is.na(Predicted_ethnicity_nothresh)) %>%
+                      filter(Predicted_ethnicity_nothresh %in% c("Asian", "Caucasian"))), 
+      Predicted_ethnicity_nothresh, Class)
+
+# too little african samples to compare
+long_predictors %>%
+  filter(Class %in% c("EOPE", "Non-PE Preterm")) %>%
+  filter(!is.na(Predicted_ethnicity_nothresh)) %>%
+  filter(Predicted_ethnicity_nothresh %in% c("Asian", "Caucasian")) %>%
+  mutate(Predicted_ethnicity_nothresh = 
+           case_when(Predicted_ethnicity_nothresh == "Asian" ~ "Samples with highest probability of Asian ancestry",
+                     Predicted_ethnicity_nothresh == "Caucasian" ~ "Samples with highest probability of European ancestry")) %>%
+  filter(Class %in% c("EOPE", "Non-PE Preterm")) %>%
+  ggplot(aes(x=reorder(cpg, beta), y=beta, fill=Class, color=Class)) +
+  scale_fill_manual(name = "True Class", values=c("#E69F00", "#999999")) +
+  scale_color_manual(name = "True Class", values=c("#E69F00", "#999999")) +
+  geom_boxplot(alpha=0.7) +
+  facet_wrap(~Predicted_ethnicity_nothresh, ncol=1) +
+  xlab("45 eoPred CpGs") +
+  ylab("\u03b2 value") +
+  theme_minimal() +
+  stat_compare_means(label="p.signif") +
+  theme(axis.text.x = element_text(angle=45, hjust=1)) +
+  ggtitle("\u03b2 value of Asian (26 EOPE, 2 nPTB) and European (9 EOPE, 12 nPTB) samples from the validation and exploratory cohorts")
+
+ggsave(file="FigureSupp_ValExpBValues_byAncestry.png", 
+       width=17, height=7,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+
+# now only Asian samples, by dataset
+
+tabyl(meta %>% filter(GEO_Dataset == "GSE125605"), Predicted_ethnicity_nothresh, Class)
+
+tabyl(meta %>% filter(Predicted_ethnicity_nothresh == 'Asian'), GEO_Dataset, Class)
+
+long_predictors %>%
+  filter(Class %in% c("EOPE", "Non-PE Preterm")) %>%
+  filter(!is.na(Predicted_ethnicity_nothresh)) %>%
+  filter(Predicted_ethnicity_nothresh == "Asian") %>%
+  filter(Class %in% c("EOPE", "Non-PE Preterm")) %>%
+  ggplot(aes(x=reorder(cpg, beta), y=beta, fill=Class, color=Class)) +
+  scale_fill_manual(name = "True Class", values=c("#E69F00", "#999999")) +
+  scale_color_manual(name = "True Class", values=c("#E69F00", "#999999")) +
+  geom_boxplot(alpha=0.7) +
+  facet_wrap(~GEO_Dataset, ncol=1) +
+  xlab("45 eoPred CpGs") +
+  ylab("\u03b2 value") +
+  theme_minimal() +
+  stat_compare_means(label="p.signif") +
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+
+```
+
+Within GSE125605, is there a difference in any of the variables between the EOPE samples that got correctly classified as EOPE and those that did not?
+
+```{r}
+
+GSE125605 <- meta %>% filter(GEO_Dataset == "GSE125605") 
+tabyl(GSE125605, Class, Pred_Class_Best)
+
+correct <- GSE125605 %>% filter(Class == "EOPE" & Pred_Class_Best == "EOPE")
+missed <- GSE125605 %>% filter(Class == "EOPE" & Pred_Class_Best == "Non-PE Preterm")
+
+range(correct$GA_RPC)
+range(correct$GA)
+median(correct$GA_RPC) # 32.36
+median(correct$GA) # 31.14
+
+range(missed$GA_RPC)
+range(missed$GA)
+median(missed$GA_RPC) # 34.93
+median(missed$GA) # 34.57
+
+GSE125605 %>% filter(Class == "EOPE") %>%
+  ggplot(aes(x=Pred_Class_Best, y=GA_RPC)) +
+  geom_boxplot(aes(color=Pred_Class_Best, fill=Pred_Class_Best), alpha=0.6, width=0.5) +
+  geom_jitter(aes(color=Pred_Class_Best)) +
+  scale_color_manual(name = "Predicted Class", values=c("#E69F00", "#999999")) + 
+  scale_fill_manual(name = "Predicted Class", values=c("#E69F00", "#999999")) +
+  theme_minimal() +
+  xlab("Predicted Class at 55% Threshold") +
+  ylab("Gestational Age") +
+  stat_compare_means(label="p.format") +
+  scale_x_discrete(labels=c("EOPE" = "EOPE (n=15)", "Non-PE Preterm" = "Non-PE Preterm (n=7)"))
+
+```
+
+What if I compare the gestational age not only at GSE125605 but at all the validation group classifications vs. misclassifications.
+
+```{r}
+
+tabyl(meta %>% filter(Group == "Validation" & Class == "EOPE"), Class, Pred_Class_Best)
+
+range(as.data.frame(meta %>% filter(Group == "Validation" & Class == "EOPE"))$GA_RPC)
+
+jitter <- position_jitter(width = 0.3)
+
+meta %>% 
+  filter(Group == "Validation" & Class == "EOPE") %>%
+  mutate(Ancestry = case_when(Predicted_ethnicity_nothresh == "African" ~ "African",
+                              Predicted_ethnicity_nothresh == "Asian" ~ "Asian",
+                              Predicted_ethnicity_nothresh == "Caucasian" ~ "European")) %>%
+  ggplot(aes(x=Pred_Class_Best, y=GA_RPC)) +
+  geom_boxplot(aes(color=Pred_Class_Best, fill=Pred_Class_Best), alpha=0.6, width=0.5) +
+  geom_point(aes(color=Pred_Class_Best), position = jitter) +
+  scale_color_manual(name = "Predicted Class", values=c("#E69F00", "#999999")) + 
+  scale_fill_manual(name = "Predicted Class", values=c("#E69F00", "#999999")) +
+  theme_minimal() +
+  xlab("Predicted Class at 55% Threshold") +
+  ylab("Gestational Age") +
+  stat_compare_means(label="p.signif", label.x=1.4, label.y=39) +
+  scale_x_discrete(labels=c("EOPE" = "EOPE (n=23)", "Non-PE Preterm" = "Non-PE Preterm (n=15)")) +
+  coord_cartesian(ylim=c(25, 39)) +
+  ggtitle("EOPE (n=38) samples in the validation group")
+
+ggsave(file="Figure3C.png", 
+       width=5, height=5,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+
+meta %>% 
+  filter(Group == "Validation" & Class == "EOPE") %>%
+  mutate(Ancestry = case_when(Predicted_ethnicity_nothresh == "African" ~ "African",
+                              Predicted_ethnicity_nothresh == "Asian" ~ "Asian",
+                              Predicted_ethnicity_nothresh == "Caucasian" ~ "European")) %>%
+  mutate(Pred_Class_Best = case_when(Pred_Class_Best == "EOPE" ~ "EOPE (n=23)",
+                                     Pred_Class_Best == "Non-PE Preterm" ~ "Non-PE Preterm (n=15)")) %>%
+  ggplot(aes(x=Ancestry, y=GA_RPC)) +
+  geom_boxplot(aes(color=Ancestry, fill=Ancestry), alpha=0.4, width=0.5) +
+  geom_point(aes(color=Ancestry), position = jitter) +
+  scale_color_manual(name = "Ancestry", values=c("#648FFF", "#DC267F", "#FFB000")) + 
+  scale_fill_manual(name = "Ancestry", values=c("#648FFF", "#DC267F", "#FFB000")) +
+  theme_minimal() +
+  facet_wrap(~Pred_Class_Best) +
+  xlab("Predicted Class at 55% Threshold") +
+  ylab("Gestational Age") +
+  coord_cartesian(ylim=c(25, 39)) +
+  stat_compare_means(label="p.format", label.x=1.7, label.y=36) + 
+  ggtitle("EOPE (n=38) samples in the validation group")
+
+ggsave(file="Figure3D.png", 
+       width=5, height=5,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+
+```
+
+# Characterization of LOPE and FGR cases in the exploratory cohort, by their predicted outcome (Table 3 + in-text information)
+
+## In-text annotations
+
+```{r}
+
+range(as.data.frame(meta %>% filter(Group == "Validation") %>% filter(Class == "EOPE" & Pred_Class_Best == "EOPE"))$EOPE) 
+mean(as.data.frame(meta %>% filter(Group == "Validation") %>% filter(Class == "EOPE" & Pred_Class_Best == "EOPE"))$EOPE) 
+mean(as.data.frame(meta %>% filter(Group == "Validation") %>% filter(Class == "EOPE" & Pred_Class_Best == "EOPE"))$GA_RPC)
+mean(as.data.frame(meta %>% filter(Group == "Validation") %>% filter(Class == "EOPE" & Pred_Class_Best == "Non-PE Preterm"))$GA_RPC)
+
+range(as.data.frame(meta %>% filter(Group == "Validation") %>% filter(Class == "Non-PE Preterm" & Pred_Class_Best == "Non-PE Preterm"))$EOPE) 
+mean(as.data.frame(meta %>% filter(Group == "Validation") %>% filter(Class == "Non-PE Preterm" & Pred_Class_Best == "Non-PE Preterm"))$EOPE) 
+
+meta %>% filter(Group == "Validation") %>% filter(Class == "Non-PE Preterm" & Pred_Class_Best == "EOPE")
+
+dim(meta %>% filter(Group == "Exploratory"))
+tabyl(meta %>% filter(Group == "Exploratory"), Class)
+
+round(range(as.data.frame(meta %>% filter(Group == "Exploratory") %>% filter(Class %in% c("Non-PE Preterm", "Non-PE Term") & Pred_Class_Best == "Non-PE Preterm"))$EOPE),2)
+round(median(as.data.frame(meta %>% filter(Group == "Exploratory") %>% filter(Class %in% c("Non-PE Preterm", "Non-PE Term") & Pred_Class_Best == "Non-PE Preterm"))$EOPE),2)
+dim(as.data.frame(meta %>% filter(Group == "Exploratory") %>% filter(Class %in% c("Non-PE Preterm", "Non-PE Term") & Pred_Class_Best == "Non-PE Preterm")))
+
+meta %>% filter(Group == "Exploratory") %>% filter(Class == "EOPE")
+round(mean(as.data.frame(meta %>% filter(Group == "Exploratory") %>% filter(Class == "LatePE" & Pred_Class_Best == "EOPE" & IUGR == "Yes"))$EOPE),2)
+meta %>% filter(Group == "Exploratory") %>% filter(Class == "LatePE" & Pred_Class_Best == "Non-PE Preterm" & IUGR == "Yes")
+
+range(mean(meta %>% filter(Condition == "CPM16") %>% filter(Pred_Class_Best == "EOPE")))
+
+```
+
+## Information for table
+
+```{r}
+
+dim(meta %>% filter(Class == "LatePE")) # 86
+dim(meta %>% filter(Class == "FGR")) # 46
+
+tabyl(meta %>% filter(Class == "LatePE"), Pred_Class_Best)
+tabyl(meta %>% filter(Class == "FGR"), Pred_Class_Best)
+
+##### EOPE PROB #####
+
+# late-pe as eope
+round(range(as.data.frame(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "EOPE"))$EOPE), 2)
+round(mean(as.data.frame(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "EOPE"))$EOPE), 2)
+
+# fgr as eope
+round(range(as.data.frame(meta %>% filter(Class == "FGR" & Pred_Class_Best == "EOPE"))$EOPE), 2)
+round(mean(as.data.frame(meta %>% filter(Class == "FGR" & Pred_Class_Best == "EOPE"))$EOPE), 2)
+
+# late pe as nptb
+round(range(as.data.frame(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "Non-PE Preterm"))$EOPE), 2)
+round(mean(as.data.frame(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "Non-PE Preterm"))$EOPE), 2)
+
+# fgr as nptb
+round(range(as.data.frame(meta %>% filter(Class == "FGR" & Pred_Class_Best == "Non-PE Preterm"))$EOPE), 2)
+round(mean(as.data.frame(meta %>% filter(Class == "FGR" & Pred_Class_Best == "Non-PE Preterm"))$EOPE), 2)
+
+# eope prob t test
+t.test(as.data.frame(meta %>% filter(Class == "FGR" & Pred_Class_Best == "Non-PE Preterm"))$EOPE, as.data.frame(meta %>% filter(Class == "FGR" & Pred_Class_Best == "EOPE"))$EOPE)
+t.test(as.data.frame(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "Non-PE Preterm"))$EOPE, as.data.frame(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "EOPE"))$EOPE)
+
+##### GA #####
+# late-pe as eope
+round(range(as.data.frame(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "EOPE"))$GA_RPC), 2)
+round(mean(as.data.frame(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "EOPE"))$GA_RPC), 2)
+# late pe as nptb
+round(range(as.data.frame(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "Non-PE Preterm"))$GA_RPC), 2)
+round(mean(as.data.frame(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "Non-PE Preterm"))$GA_RPC), 2)
+t.test(as.data.frame(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "Non-PE Preterm"))$GA_RPC, as.data.frame(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "EOPE"))$GA_RPC)
+
+# fgr as eope
+round(range(as.data.frame(meta %>% filter(Class == "FGR" & Pred_Class_Best == "EOPE"))$GA_RPC), 2)
+round(mean(as.data.frame(meta %>% filter(Class == "FGR" & Pred_Class_Best == "EOPE"))$GA_RPC), 2)
+# fgr as nptb
+round(range(as.data.frame(meta %>% filter(Class == "FGR" & Pred_Class_Best == "Non-PE Preterm"))$GA_RPC), 2)
+round(mean(as.data.frame(meta %>% filter(Class == "FGR" & Pred_Class_Best == "Non-PE Preterm"))$GA_RPC), 2)
+t.test(as.data.frame(meta %>% filter(Class == "FGR" & Pred_Class_Best == "Non-PE Preterm"))$GA_RPC, as.data.frame(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "EOPE"))$GA_RPC)
+
+
+##### CATEGORICAL #####
+
+# latePE
+tabyl(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "EOPE"), Sex)
+tabyl(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "Non-PE Preterm"), Sex)
+latePE_sex <- data.frame(
+  "EOPE" = c(10, 14),
+  "nPTB" = c(31, 31),
+  row.names = c("Female", "Male"),
+  stringsAsFactors = FALSE
+)
+fisher.test(latePE_sex)
+
+tabyl(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "EOPE"), Predicted_ethnicity_nothresh)
+tabyl(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "Non-PE Preterm"), Predicted_ethnicity_nothresh)
+latePE_ancestry <- data.frame(
+  "EOPE" = c(5, 3, 16),
+  "nPTB" = c(23, 9, 30),
+  row.names = c("African", "Asian", "European"),
+  stringsAsFactors = FALSE
+)
+fisher.test(latePE_ancestry)
+
+tabyl(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "EOPE"), IUGR)
+tabyl(meta %>% filter(Class == "LatePE" & Pred_Class_Best == "Non-PE Preterm"), IUGR)
+latePE_FGR <- data.frame(
+  "EOPE" = c(4, 4, 16),
+  "nPTB" = c(2, 5, 55),
+  row.names = c("Yes", "No", "Unknown"),
+  stringsAsFactors = FALSE
+)
+fisher.test(latePE_FGR)
+
+# fgr
+tabyl(meta %>% filter(Class == "FGR" & Pred_Class_Best == "EOPE"), Sex)
+tabyl(meta %>% filter(Class == "FGR" & Pred_Class_Best == "Non-PE Preterm"), Sex)
+FGR_sex <- data.frame(
+  "EOPE" = c(4, 5),
+  "nPTB" = c(18, 19),
+  row.names = c("Female", "Male"),
+  stringsAsFactors = FALSE
+)
+fisher.test(FGR_sex)
+
+tabyl(meta %>% filter(Class == "FGR" & Pred_Class_Best == "EOPE"), Predicted_ethnicity_nothresh)
+tabyl(meta %>% filter(Class == "FGR" & Pred_Class_Best == "Non-PE Preterm"), Predicted_ethnicity_nothresh)
+FGR_ancestry <- data.frame(
+  "EOPE" = c(2, 3, 4),
+  "nPTB" = c(5, 5, 27),
+  row.names = c("African", "Asian", "European"),
+  stringsAsFactors = FALSE
+)
+fisher.test(FGR_ancestry)
+
+tabyl(meta %>% filter(Class == "FGR" & Pred_Class_Best == "EOPE"), IUGR)
+tabyl(meta %>% filter(Class == "FGR" & Pred_Class_Best == "Non-PE Preterm"), IUGR)
+
+```
+
+## Apply 5 CpG model
+
+```{r setup}
+
+set.seed(2022)
+mod5 <- mixOmics::splsda(x_train,
+                        y_train,
+                        ncomp = 1,
+                        keepX = 5)
+
+predictPreeclampsia_5 <- function(betas, ...){
+
+  trainCpGs <- colnames(mod5$X)
+  peCpGs <- mixOmics::selectVar(mod5)$name
+  
+  # check that there are no NAs in the predictors (or if there are, how many)
+  pp <- intersect(colnames(betas), peCpGs)
+  
+  if(length(pp) < length(peCpGs)){
+    warning(paste(
+      "Only", length(pp), "out of 45 predictors present."
+    ))
+  } else {
+    message(paste(length(pp), "of 45 predictors present."))
+    message("BMIQ normalization is recommended for best results.")
+  }
+  
+  # set up data for prediction
+  
+  # if input data is missing any of the cpgs present in the training data, this function
+  # adds the ones that are missing as NAs
+  # necessary for `mixOmics::predict` to work
+  
+  outersect = function(x, y) {
+    sort(c(x[!x%in%y],
+           y[!y%in%x]))
+  }
+  
+  if(inherits(betas, 'matrix')){
+  } else if (inherits(betas, 'array')) {
+  } else {
+    
+    # throw an error
+    print(paste0("Input data must be a matrix or an array"))
+  }
+  
+  subset <- betas[,colnames(betas) %in% trainCpGs]
+  
+  # order
+  subset <- subset[drop=FALSE,, trainCpGs]
+  
+  if(all(colnames(subset) == trainCpGs) == FALSE){
+    stop()
+  } else
+    
+    # predict
+    out <- mixOmics:::predict.mixo_spls(mod5, subset)
+  
+  # get class probabilities
+  CP <- out$predict[,,1]
+  CP <- t(apply(as.matrix(CP), 1, function(data) exp(data)/sum(exp(data))))
+  CP <- as.data.frame(CP) %>% tibble::rownames_to_column("Sample_ID")
+  CP$Pred_Class <- CP$comp1
+  CP <- CP %>%
+    dplyr::mutate(Pred_Class = dplyr::case_when(EOPE > `Non-PE Preterm` ~ "EOPE",
+                                                EOPE < `Non-PE Preterm` ~ "Normotensive"))
+  
+  return(CP)
+}
+
+preds5_val <- predictPreeclampsia_5(t(val))
+preds5_exp <- predictPreeclampsia_5(t(exp))
+
+all(preds5_val$Sample_ID == valMeta$Sample_ID)
+all(preds5_exp$Sample_ID == expMeta$Sample_ID)
+
+# join with metadata
+valMeta$EOPE_5 <- preds5_val$EOPE
+valMeta$nPTB_5 <- preds5_val$`Non-PE Preterm`
+valMeta$Pred_Class_5 <- preds5_val$Pred_Class
+
+expMeta$EOPE_5 <- preds5_exp$EOPE
+expMeta$nPTB_5 <- preds5_exp$`Non-PE Preterm`
+expMeta$Pred_Class_5 <- preds5_exp$Pred_Class
+
+# assess
+tabyl(valMeta, Class, Pred_Class_5) # 12 EOPE misclassified as normotensive and 3 nPTB misclassified as EOPE
+tabyl(valMeta, Class, Pred_Class) # as opposed to 15 EOPE misclassified as normotensive and 2 nPTB misclassified as nPTB
+
+tabyl(expMeta, Class, Pred_Class)
+tabyl(expMeta, Class, Pred_Class_5)
+
+```
+
+First, I want to calculate the ROC curve of the 5 probe model.
+
+```{r}
+
+valMeta <- valMeta %>% mutate(Class_Binary = case_when(Class == "EOPE" ~ 1, Class == "Non-PE Preterm" ~ 0))
+
+# create an roc object
+roc_obj <- roc(valMeta$Class_Binary, valMeta$EOPE_5)
+
+# review the roc object
+roc_obj
+
+png(here::here("Output", "2022_Manuscript", "FigureSupp_ROC5CpGs.png"), 
+    width = 1000, height = 1000,
+    pointsize = 12, bg = "transparent",
+    res=200)
+plot(roc_obj, print.thres="best", print.auc=TRUE, print.auc.x=1, print.auc.y=1, main="ROC Curve in Validation Group (5 CpG Model)")
+dev.off()
+
+# get the "best" "threshold"
+# there are lots of other options for other metrics as well
+coords(roc_obj, "best", "threshold") # similar specificity and sensitivity, similar threshold
+
+```
+
+Then, I plot the same probability plot as I did for the 45 CpG model, but for this model instead.
+
+```{r}
+
+meta$EOPE_5 <- c(valMeta$EOPE_5, expMeta$EOPE_5)
+meta$nPTB_5 <- c(valMeta$nPTB_5 , expMeta$nPTB_5)
+
+meta <- meta %>% mutate(Pred_Class_5 = case_when(EOPE_5 > 0.5594305 ~ "EOPE",
+                                                 EOPE_5 < 0.5594305 ~ "Non-PE Preterm"))
+
+meta %>% 
+  mutate(True_Class = factor(Class,
+                             levels=c("CPM16", "FGR", "LatePE", "Non-PE Term", "Non-PE Preterm", "EOPE"))) %>%
+  ggplot() +
+  geom_boxplot(aes(x = True_Class,
+                  y = EOPE_5),
+               width=0.3,
+               alpha=0.5,
+               color="darkgrey") +
+  geom_jitter(aes(x = True_Class,
+                  y = EOPE_5, 
+                  color = Pred_Class_5), 
+              alpha = 0.5, 
+              position = position_jitter(width = .1)) + 
+  coord_flip() +
+  ylab("Class Probability of EOPE") +
+  xlab("True Class") +
+  ylim(0,1) +
+  scale_color_manual(name = "Predicted Class", values=c("#E69F00", "#999999")) + 
+  theme_minimal() +
+  geom_hline(yintercept = 0.5454187, 
+             color = "#E69F00", size=1) +
+  ggtitle("Probability of EOPE of Validation + Exploratory Groups (n=377)")
+
+ggsave(file="FigureSupp_5CpgProbs.png", 
+       width=10, height=3.5,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+
+MAE(meta$EOPE_5, meta$EOPE)
+
+```
+
+# Cell composition and ancestry (Figure 4)
+
+## Boxplots of cell compositions of EOPE vs. nPTB samples before, using the true labels, and after, using eoPred-assigned labels (in training vs. validation & exploratory cohorts) 
+
+### Training
+
+```{r}
+
+# cell composition of samples before and after
+celltypes_Train <- trainMeta %>%
+  dplyr::select(Class, Trophoblasts, Stromal, Hofbauer, Endothelial, nRBC, Syncytiotrophoblast) %>%
+  pivot_longer(!Class, names_to="cell_type")
+
+
+# followed this tutorial https://www.datanovia.com/en/blog/how-to-perform-multiple-paired-t-tests-in-r/
+celltypes_Train$cell_type <- factor(celltypes_Train$cell_type, levels = c("Hofbauer", "nRBC", "Stromal", "Endothelial", "Trophoblasts", "Syncytiotrophoblast"))
+
+stat <-
+celltypes_Train %>%
+  group_by(cell_type) %>%
+  rstatix::pairwise_t_test(
+    value ~ Class, 
+    p.adjust.method = "bonferroni"
+      )
+
+head(stat)
+
+bxp <- ggboxplot(
+  celltypes_Train, x = "cell_type", y = "value",
+  color="Class", palette=c("#E69F00", "#999999"),
+  fill="Class", alpha=0.5
+  )
+
+# Add statistical test p-values
+stat.test <- stat %>% add_xy_position(x = "cell_type")
+
+bxp + stat_pvalue_manual(
+  stat.test, label = "p.adj.signif", 
+  step.increase = 0
+  ) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2),
+             aes(color = factor(Class)), show.legend = FALSE, alpha = 0.4) +
+  xlab("Cell Type") +
+  ylab("Proportion") +
+  ylim(0,1)
+
+ggsave(file="FigureSupp_CellComposition_Training.png", 
+       width=10, height=3,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+
+
+```
+
+### Validation
+
+```{r}
+
+##### 1: ORIGINAL LABELS ######
+celltypes_Val <- meta %>%
+  filter(Group == "Validation") %>%
+  dplyr::select(Class, Trophoblasts, Stromal, Hofbauer, Endothelial, nRBC, Syncytiotrophoblast) %>%
+  pivot_longer(!Class, names_to="cell_type")
+
+# followed this tutorial https://www.datanovia.com/en/blog/how-to-perform-multiple-paired-t-tests-in-r/
+celltypes_Val$cell_type <- factor(celltypes_Val$cell_type, levels = c("Hofbauer", "nRBC", "Stromal", "Endothelial", "Trophoblasts", "Syncytiotrophoblast"))
+
+stat <-
+celltypes_Val %>%
+  group_by(cell_type) %>%
+  rstatix::pairwise_t_test(
+    value ~ Class, 
+    p.adjust.method = "bonferroni"
+      )
+
+head(stat)
+
+bxp <- ggboxplot(
+  celltypes_Val, x = "cell_type", y = "value",
+  color="Class", palette=c("#E69F00", "#999999"),
+  fill="Class", alpha=0.5
+  )
+
+# Add statistical test p-values
+stat.test <- stat %>% add_xy_position(x = "cell_type")
+
+bxp + stat_pvalue_manual(
+  stat.test, label = "p.adj.signif", 
+  step.increase = 0
+  ) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2),
+             aes(color = factor(Class)), show.legend = FALSE, alpha = 0.4) +
+  xlab("Cell Type") +
+  ylab("Proportion") +
+  ylim(0,1)
+
+ggsave(file="FigureSupp_CellComposition_Validation.png", 
+       width=10, height=3,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+
+
+##### 2: eoPred-assigned Labels #####
+celltypes_Val <- meta %>%
+  filter(Group == "Validation") %>%
+  dplyr::select(Pred_Class_Best, Trophoblasts, Stromal, Hofbauer, Endothelial, nRBC, Syncytiotrophoblast) %>%
+  pivot_longer(!Pred_Class_Best, names_to="cell_type")
+
+# followed this tutorial https://www.datanovia.com/en/blog/how-to-perform-multiple-paired-t-tests-in-r/
+celltypes_Val$cell_type <- factor(celltypes_Val$cell_type, levels = c("Hofbauer", "nRBC", "Stromal", "Endothelial", "Trophoblasts", "Syncytiotrophoblast"))
+
+stat <-
+celltypes_Val %>%
+  group_by(cell_type) %>%
+  rstatix::pairwise_t_test(
+    value ~ Pred_Class_Best, 
+    p.adjust.method = "bonferroni"
+      )
+
+head(stat)
+
+bxp <- ggboxplot(
+  celltypes_Val, x = "cell_type", y = "value",
+  color="Pred_Class_Best", palette=c("#E69F00", "#999999"),
+  fill="Pred_Class_Best", alpha=0.5
+  )
+
+# Add statistical test p-values
+stat.test <- stat %>% add_xy_position(x = "cell_type")
+
+bxp + stat_pvalue_manual(
+  stat.test, label = "p.adj.signif", 
+  step.increase = 0
+  ) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2),
+             aes(color = factor(Pred_Class_Best)), show.legend = FALSE, alpha = 0.4) +
+  xlab("Cell Type") +
+  ylab("Proportion") +
+  ylim(0,1)
+
+ggsave(file="FigureSupp_CellComposition_Validation_eoPredlabels.png", 
+       width=10, height=3,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+
+
+```
+
+## Model probability against cell composition within EOPE and within nPTB
+
+```{r}
+
+meta %>%
+  dplyr::rename(Cytotrophoblast = Trophoblasts) %>%
+  dplyr::select(Pred_Class_Best, EOPE, 
+                Syncytiotrophoblast, Cytotrophoblast, Endothelial, Stromal, Hofbauer, nRBC) %>%
+  pivot_longer(!c(Pred_Class_Best, EOPE),
+               values_to = "Proportion", names_to = "Cell Type") %>%
+  arrange(factor(`Cell Type`, levels=c("Syncytiotrophoblast",
+                                       "Trophoblasts",
+                                       "Endothelial",
+                                       "Stromal",
+                                       "Hofbauer",
+                                       "nRBC"))) %>%
+  ggplot(aes(x=EOPE, y=Proportion, color=Pred_Class_Best)) +
+  geom_point(alpha=0.2) +
+  geom_smooth(method="lm", se=FALSE) +
+  facet_wrap(~`Cell Type`, nrow=1) +
+  scale_color_manual(name = "Predicted Class", values=c("#E69F00", "#999999"))  +
+  coord_cartesian(xlim=c(0,1), ylim=c(0,1)) +
+  theme_bw() +
+  stat_cor(label.x=0) +
+  xlab("EOPE Probability") +
+  ggtitle("Relationship between cell type proportions and probability of EOPE of samples in the validation and exploratory groups (n=377)")
+
+ggsave(file="Figure4A.png", 
+       width=15, height=3,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+
+meta %>%
+  dplyr::rename(Cytotrophoblast = Trophoblasts) %>%
+  dplyr::select(Pred_Class_Best, EOPE, 
+                Syncytiotrophoblast, Cytotrophoblast, Endothelial, Stromal, Hofbauer, nRBC) %>%
+  pivot_longer(!c(Pred_Class_Best, EOPE),
+               values_to = "Proportion", names_to = "Cell Type") %>%
+  arrange(factor(`Cell Type`, levels=c("Syncytiotrophoblast",
+                                       "Trophoblasts",
+                                       "Endothelial",
+                                       "Stromal",
+                                       "Hofbauer",
+                                       "nRBC"))) %>%
+  ggplot(aes(x=EOPE, y=Proportion, color="grey")) +
+  geom_point(alpha=0.2) +
+  geom_smooth(method="lm", se=FALSE) +
+  facet_wrap(~`Cell Type`, nrow=1) +
+  coord_cartesian(xlim=c(0,1), ylim=c(0,1)) +
+  theme_bw() +
+  stat_cor(aes(label = ..r.label..), label.x=0) +
+  xlab("EOPE Probability") +
+  ggtitle("Relationship between cell type proportions and probability of EOPE of samples in the validation and exploratory groups (n=377)")
+
+ggsave(file="Figure4A_maybe.png", 
+       width=15, height=3,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+
+meta %>%
+  filter(Group == "Validation" & Class == "EOPE") %>%
+  dplyr::select(Pred_Class_Best, EOPE, 
+                Syncytiotrophoblast, Trophoblasts, Endothelial, Stromal, Hofbauer, nRBC) %>%
+  pivot_longer(!c(Pred_Class_Best, EOPE),
+               values_to = "Proportion", names_to = "Cell Type") %>%
+  arrange(factor(`Cell Type`, levels=c("Syncytiotrophoblast",
+                                       "Trophoblasts",
+                                       "Endothelial",
+                                       "Stromal",
+                                       "Hofbauer",
+                                       "nRBC"))) %>%
+  ggplot(aes(x=EOPE, y=Proportion, color=Pred_Class_Best)) +
+  geom_point() +
+  geom_smooth(method="lm", se=FALSE) +
+  facet_wrap(~`Cell Type`, nrow=1) +
+  scale_color_manual(name = "Predicted Class", values=c("#E69F00", "#999999"))  +
+  coord_cartesian(xlim=c(0,1), ylim=c(0,1)) +
+  theme_bw() +
+  stat_cor(aes(label = ..r.label..), label.x=0) +
+  xlab("EOPE Probability") +
+  ggtitle("Relationship between cell type proportions and probability of EOPE of EOPE (n=38) samples in validation group")
+
+ggsave(file="Figure4A_OLD.png", 
+       width=15, height=3,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+
+meta %>%
+  filter(Group == "Validation" & Class == "Non-PE Preterm") %>%
+  dplyr::select(Pred_Class_Best, EOPE, 
+                Syncytiotrophoblast, Trophoblasts, Endothelial, Stromal, Hofbauer, nRBC) %>%
+  pivot_longer(!c(Pred_Class_Best, EOPE),
+               values_to = "Proportion", names_to = "Cell Type") %>%
+  arrange(factor(`Cell Type`, levels=c("Syncytiotrophoblast",
+                                       "Trophoblasts",
+                                       "Endothelial",
+                                       "Stromal",
+                                       "Hofbauer",
+                                       "nRBC"))) %>%
+  ggplot(aes(x=EOPE, y=Proportion, color=Pred_Class_Best)) +
+  geom_point() +
+  geom_smooth(method="lm", se=FALSE) +
+  facet_wrap(~`Cell Type`, nrow=1) +
+  scale_color_manual(name = "Predicted Class", values=c("#E69F00", "#999999"))  +
+  coord_cartesian(xlim=c(0,1), ylim=c(0,1)) +
+  theme_bw() +
+  stat_cor(aes(label = ..r.label..), label.x=0) +
+  xlab("EOPE Probability") +
+  ggtitle("Relationship between cell type proportions and probability of EOPE of Non-PE Preterm (n=11) samples in validation group")
+
+ggsave(file="FigureSupp_CellCompositionEOPEProb.png", 
+       width=15, height=3,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+
+```
+
+## Look at average beta value of 45 predictive probes by ancestry, within each class (EOPE, nPTB)
+
+### Original classes
+
+**Boxplot:**
+
+```{r}
+
+tabyl(meta %>% filter(Group == "Validation"), Predicted_ethnicity_nothresh, Class)
+tabyl(trainMeta, Predicted_ethnicity_nothresh, Class)
+
+dim(long_predictors)
+dim(long_trainPredictors)
+
+colnames(long_predictors)
+colnames(long_trainPredictors)
+
+x <- long_predictors %>% dplyr::select(cpg, beta, Class, Predicted_ethnicity_nothresh)
+y <- long_trainPredictors %>% dplyr::select(cpg, beta, Class, Predicted_ethnicity_nothresh)
+z <- rbind(x, y)
+
+z %>%
+  filter(Class %in% c("EOPE", "Non-PE Preterm")) %>%
+  filter(!is.na(Predicted_ethnicity_nothresh)) %>%
+  mutate(Ancestry = case_when(Predicted_ethnicity_nothresh == "African" ~ "African (12 EOPE, 5 nPTB)",
+                              Predicted_ethnicity_nothresh == "Asian" ~ "Asian (33 EOPE, 8 nPTB)",
+                              Predicted_ethnicity_nothresh == "Caucasian" ~ "European (35 EOPE, 39 nPTB)")) %>%
+  ggplot(aes(x=reorder(cpg, beta), y=beta, fill=Ancestry))+
+  geom_boxplot() +
+  geom_boxplot(alpha = 0.5) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2),
+             aes(color = factor(Ancestry)), show.legend = FALSE, alpha = 0.2) +
+  scale_color_manual(name = "Ancestry", values=c("#648FFF", "#DC267F", "#FFB000")) + 
+  scale_fill_manual(name = "Ancestry", values=c("#648FFF", "#DC267F", "#FFB000")) +
+  facet_wrap(~Class, ncol=1) +
+  ylab("\u03b2 value") +
+  ylim(0,1) +
+  xlab("45 predictive CpGs") +
+  stat_compare_means(label="p.signif") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle=45, hjust=1)) +
+  ggtitle("Average \u03b2 value at EOPE (n=80) and nPTB (n=52) samples (original labels) from the training and validation groups")
+
+ggsave(file="FigureSupp_AncestryOriginalLabels_BetaValues.png", 
+       width=15, height=6,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+
+```
+
+**Density plot:**
+
+```{r}
+
+z %>%
+  filter(Class %in% c("EOPE", "Non-PE Preterm")) %>%
+  filter(!is.na(Predicted_ethnicity_nothresh)) %>%
+  mutate(Ancestry = case_when(Predicted_ethnicity_nothresh == "African" ~ "African (12 EOPE, 5 Non-PE Preterm)",
+                              Predicted_ethnicity_nothresh == "Asian" ~ "Asian (33 EOPE, 8 Non-PE Preterm)",
+                              Predicted_ethnicity_nothresh == "Caucasian" ~ "European (35 EOPE, 39 Non-PE Preterm)")) %>%
+  ggplot(aes(x=beta, y=Ancestry, color=Class, fill=Class))+
+  geom_density_ridges(alpha=0.3) +
+  scale_color_manual(name = "Class", values=c("#E69F00", "#999999")) + 
+  scale_fill_manual(name = "Class", values=c("#E69F00", "#999999")) +
+  xlab("\u03b2 values of EOPE and nPTB samples in the training and validation groups at 45 predictive CpGs") +
+  theme_minimal() 
+
+ggsave(file="FigureSupp_Ancestry_Density.png", 
+       width=12, height=3,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+  
+```
+
+### Predicted classes
+
+**Boxplot:**
+
+```{r}
+
+tabyl(meta, Predicted_ethnicity_nothresh, Pred_Class)
+
+long_predictors %>%
+  filter(!is.na(Predicted_ethnicity_nothresh)) %>%
+  mutate(Ancestry = case_when(Predicted_ethnicity_nothresh == "African" ~ "African (14 EOPE, 43 Non-PE Preterm)",
+                              Predicted_ethnicity_nothresh == "Asian" ~ "Asian (19 EOPE, 69 Non-PE Preterm)",
+                              Predicted_ethnicity_nothresh == "Caucasian" ~ "European (60 EOPE, 171 Non-PE Preterm)")) %>%
+  ggplot(aes(x=reorder(cpg, beta), y=beta, fill=Ancestry))+
+  geom_boxplot() +
+  geom_boxplot(alpha = 0.5) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2),
+             aes(color = factor(Ancestry)), show.legend = FALSE, alpha = 0.2) +
+  scale_color_manual(name = "Ancestry", values=c("#648FFF", "#DC267F", "#FFB000")) + 
+  scale_fill_manual(name = "Ancestry", values=c("#648FFF", "#DC267F", "#FFB000")) +
+  facet_wrap(~Pred_Class_Best, ncol=1) +
+  ylab("\u03b2 value of samples in the validation and exploratory groups") +
+  ylim(0,1) +
+  xlab("45 predictive CpGs") +
+  stat_compare_means(label="p.signif") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+
+ggsave(file="FigureSupp_AncestryPredLabels_BetaValues.png", 
+       width=15, height=6,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+
+```
+
+**Density plot:**
+
+```{r}
+
+long_predictors %>%
+  filter(!is.na(Predicted_ethnicity_nothresh)) %>%
+  mutate(Ancestry = case_when(Predicted_ethnicity_nothresh == "African" ~ "African (12 EOPE, 5 Non-PE Preterm)",
+                              Predicted_ethnicity_nothresh == "Asian" ~ "Asian (33 EOPE, 8 Non-PE Preterm)",
+                              Predicted_ethnicity_nothresh == "Caucasian" ~ "European (35 EOPE, 39 Non-PE Preterm)")) %>%
+  ggplot(aes(x=beta, y=Ancestry, color=Pred_Class_Best, fill=Pred_Class_Best)) +
+  geom_density_ridges(alpha=0.3) +
+  scale_color_manual(name = "Class", values=c("#E69F00", "#999999")) + 
+  scale_fill_manual(name = "Class", values=c("#E69F00", "#999999")) +
+  xlab("\u03b2 values of all samples in the validation and exploratory groups at 45 predictive CpGs") +
+  theme_minimal()
+  
+ggsave(file="FigureSupp_Ancestry_Density_2.png", 
+       width=12, height=3,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+  
+```
+
+### Plot EOPE/nPTB within Asian samples and within European samples, faceted by dataset
+
+```{r}
+
+tabyl(meta, Predicted_ethnicity_nothresh, Pred_Class)
+
+head(long_predictors)
+
+long_predictors %>%
+  filter(!is.na(Predicted_ethnicity_nothresh)) %>%
+  mutate(Ancestry = case_when(Predicted_ethnicity_nothresh == "African" ~ "African (14 EOPE, 43 Non-PE Preterm)",
+                              Predicted_ethnicity_nothresh == "Asian" ~ "Asian (19 EOPE, 69 Non-PE Preterm)",
+                              Predicted_ethnicity_nothresh == "Caucasian" ~ "European (60 EOPE, 171 Non-PE Preterm)")) %>%
+  filter(Ancestry == "Asian (19 EOPE, 69 Non-PE Preterm)") %>%
+  filter(Class %in% c("EOPE", "Non-PE Preterm")) %>%
+  ggplot(aes(x=reorder(cpg, beta), y=beta, fill=Class))+
+  geom_boxplot() +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2),
+             aes(color = factor(Class)), show.legend = FALSE, alpha = 0.2) +
+  scale_color_manual(name = "Class", values=c("#E69F00", "#999999")) + 
+  scale_fill_manual(name = "Class", values=c("#E69F00", "#999999")) +
+  ylab("\u03b2 value of samples in GSE1256005") +
+  ylim(0,1) +
+  xlab("45 predictive CpGs") +
+  stat_compare_means(label="p.signif") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+
+ggsave(file="FigureSupp_AncestryPredLabels_BetaValues.png", 
+       width=15, height=6,
+       path = here::here("Output", "2022_Manuscript"),
+       bg = "transparent", 
+       dpi=500)
+
+```
+
+# Predictor analysis (Figure 5)
+
+## Chromosome by chromosome
+
+```{r}
+
+predictorsInfo <- probeInfo %>% filter(probeID %in% predictors)
+tabyl(predictorsInfo, chr)
+
+# following tutorial https://bernatgel.github.io/karyoploter_tutorial//Examples/CpGIslands/CpGIslands.html
+ahub <- AnnotationHub()
+cpgs <- ahub[["AH5086"]]
+head(cpgs)
+
+# plot chr1, chr3, chr6, chr16 chr with >3 CpGs)
+
+# chr1
+chr1_preds <- predictorsInfo %>% filter(chr=="chr1")
+chr1_preds
+
+png(here::here("Output", "2022_Manuscript", "FigureSupp_Chr1.png"), 
+    width = 2000, height = 600,
+    pointsize = 12, bg = "transparent",
+    res=200)
+kp <- plotKaryotype(chromosomes="chr1")
+kpAddBaseNumbers(kp)
+kpPlotRegions(kp, data=cpgs, col="#CCCCCC44", border="#CCCCCC44", r0=0, r1=0.2)
+kpPlotMarkers(kp, chr=chr1_preds$chr, x=chr1_preds$pos, labels=chr1_preds$probeID)
+dev.off()
+
+# chr3
+chr3_preds <- predictorsInfo %>% filter(chr=="chr3")
+chr3_preds
+
+png(here::here("Output", "2022_Manuscript", "FigureSupp_Chr3.png"), 
+    width = 2000, height = 600,
+    pointsize = 12, bg = "transparent",
+    res=200)
+kp <- plotKaryotype(chromosomes="chr3")
+kpAddBaseNumbers(kp)
+kpPlotRegions(kp, data=cpgs, col="#CCCCCC44", border="#CCCCCC44", r0=0, r1=0.2)
+kpPlotMarkers(kp, chr=chr3_preds$chr, x=chr3_preds$pos, labels=chr3_preds$probeID)
+dev.off()
+
+# chr6
+chr6_preds <- predictorsInfo %>% filter(chr=="chr6")
+chr6_preds
+
+png(here::here("Output", "2022_Manuscript", "FigureSupp_Chr6.png"), 
+    width = 2000, height = 600,
+    pointsize = 12, bg = "transparent",
+    res=200)
+kp <- plotKaryotype(chromosomes="chr6")
+kpAddBaseNumbers(kp)
+kpPlotRegions(kp, data=cpgs, col="#CCCCCC44", border="#CCCCCC44", r0=0, r1=0.2)
+kpPlotMarkers(kp, chr=chr6_preds$chr, x=chr6_preds$pos, labels=chr6_preds$probeID)
+dev.off()
+
+# chr16
+chr16_preds <- predictorsInfo %>% filter(chr=="chr16")
+chr16_preds
+
+png(here::here("Output", "2022_Manuscript", "FigureSupp_Chr16.png"), 
+    width = 2000, height = 600,
+    pointsize = 12, bg = "transparent",
+    res=200)
+kp <- plotKaryotype(chromosomes="chr16")
+kpAddBaseNumbers(kp)
+kpPlotRegions(kp, data=cpgs, col="#CCCCCC44", border="#CCCCCC44", r0=0, r1=0.2)
+kpPlotMarkers(kp, chr=chr16_preds$chr, x=chr16_preds$pos, labels=chr16_preds$probeID)
+dev.off()
+
+
+```
+
+## Location of probes
+
+```{r}
+
+predictorsInfo
+
+tabyl(predictorsInfo, UCSC_RefGene_Group) 
+tabyl(predictorsInfo, Regulatory_Feature_Group) 
+
+predictorsInfo %>% filter(UCSC_RefGene_Group == "")
+
+```
+
+- 14 probes map to gene bodies
+- 15 probes map to regulatory regions including 5'UTR and TSS1500 promoter regions
+- 2 probes map to the 3'UTR regions
+
+# Supplementary (Ancestry Ternary Plots)
+
+```{r}
+
+library(ggtern)
+
+trainMeta %>%
+  mutate(European = Prob_Caucasian,
+         African = Prob_African,
+         Asian = Prob_Asian) %>%
+  mutate(Predicted_ethnicity = case_when(Predicted_ethnicity == "Caucasian" ~ "European",
+                                         Predicted_ethnicity == "African" ~ "African",
+                                         Predicted_ethnicity == "Asian" ~ "Asian",
+                                         Predicted_ethnicity == "Ambiguous" ~ "Ambiguous")) %>%
+  ggtern(aes(x=European, y=African, z=Asian, color=fct_relevel(Predicted_ethnicity,
+                                                               c("African", "European", "Asian",
+                                                                 "Ambiguous")))) +
+  geom_point() +
+  scale_color_manual(values=c("#785EF0", "#DC267F", "#FE6100", "#6B625E")) +
+  theme_bw() +
+  theme_showarrows() +
+  theme_hidetitles() +
+  labs(color = "Predicted ethnicity") +
+  ggtitle("Training Cohort")
+
+tabyl(trainMeta, Predicted_ethnicity)
+
+ggsave(here::here("Output", "2022_Manuscript", "FigureSupp_Ancestry.png"),
+       width=7, height=7,
+       dpi=300)
+
+meta %>%
+  mutate(European = Prob_Caucasian,
+         African = Prob_African,
+         Asian = Prob_Asian) %>%
+  filter(!is.na(Predicted_ethnicity_nothresh)) %>%
+  mutate(Predicted_ethnicity = case_when(Highest_Prob < 0.75 ~ "Ambiguous",
+    Predicted_ethnicity_nothresh == "Caucasian" ~ "European",
+                                         Predicted_ethnicity_nothresh == "African" ~ "African",
+                                         Predicted_ethnicity_nothresh == "Asian" ~ "Asian")) %>%
+  ggtern(aes(x=European, y=African, z=Asian, color=fct_relevel(Predicted_ethnicity,
+                                                               c("African", "European", "Asian",
+                                                                 "Ambiguous")))) +
+  geom_point() +
+  scale_color_manual(values=c("#785EF0", "#DC267F", "#FE6100", "#6B625E")) +
+  theme_bw() +
+  theme_showarrows() +
+  theme_hidetitles() +
+  labs(color = "Predicted ethnicity") +
+  ggtitle("Validation + Exploratory Cohort")
+
+tabyl(meta, Predicted_ethnicity_nothresh)
+
+ggsave(here::here("Output", "2022_Manuscript", "FigureSupp_Ancestry_ValExp.png"),
+       width=7, height=7,
+       dpi=300)
+
+range(expMeta %>% filter(Class == "EOPE") %>% pull(GA_RPC))
+mean(expMeta %>% filter(Class == "EOPE") %>% pull(GA_RPC))
+tabyl(expMeta %>% filter(Class == "EOPE"), Sex)
+
+range(expMeta %>% filter(Class == "LatePE") %>% pull(GA_RPC))
+mean(expMeta %>% filter(Class == "LatePE") %>% pull(GA_RPC))
+tabyl(expMeta %>% filter(Class == "LatePE"), Sex)
+
+range(expMeta %>% filter(Class == "FGR") %>% pull(GA_RPC))
+mean(expMeta %>% filter(Class == "FGR") %>% pull(GA_RPC))
+tabyl(expMeta %>% filter(Class == "FGR"), Sex)
+
+range(expMeta %>% filter(Class == "Non-PE Preterm") %>% pull(GA_RPC))
+mean(expMeta %>% filter(Class == "Non-PE Preterm") %>% pull(GA_RPC))
+tabyl(expMeta %>% filter(Class == "Non-PE Preterm"), Sex)
+
+range(expMeta %>% filter(Class == "Non-PE Term") %>% filter(!is.na(GA_RPC)) %>% pull(GA_RPC))
+mean(expMeta %>% filter(Class == "Non-PE Term") %>% filter(!is.na(GA_RPC)) %>% pull(GA_RPC))
+tabyl(expMeta %>% filter(Class == "Non-PE Term"), Sex)
+
+range(expMeta %>% filter(Class == "CPM16") %>% pull(GA))
+mean(expMeta %>% filter(Class == "CPM16") %>% pull(GA))
+
+```
+
+
+# Supplementary q - get average beta values of EOPE & nPTB samples at the 45 predictive CpGs, by dataset and ancestry
+
+## Training
+
+```{r}
+
+library(Metrics)
+
+tabyl(trainMeta, Class)
+tabyl(trainMeta, Class, Predicted_ethnicity_nothresh)
+
+# TRAINING
+mean(long_trainPredictors %>% filter(Class == "EOPE") %>% pull(beta))
+mean(long_trainPredictors %>% filter(Class == "Non-PE Preterm") %>% pull(beta))
+round(abs(0.4694937-0.6068958),2) 
+
+t.test(long_trainPredictors %>% filter(Class == "EOPE") %>% pull(beta), 
+       long_trainPredictors %>% filter(Class == "Non-PE Preterm") %>% pull(beta)) # yes!
+
+# by ancestry
+mean(long_trainPredictors %>% 
+       filter(Class == "EOPE" & Predicted_ethnicity_nothresh == "Asian") %>%
+       pull(beta))
+mean(long_trainPredictors %>% 
+       filter(Class == "Non-PE Preterm" & Predicted_ethnicity_nothresh == "Asian") %>%
+       pull(beta))
+round(abs(0.4909163-0.6172085), 2) # 0.13
+
+t.test(long_trainPredictors %>% filter(Class == "EOPE" & Predicted_ethnicity_nothresh == "Asian") %>% pull(beta), 
+       long_trainPredictors %>% filter(Class == "Non-PE Preterm" & Predicted_ethnicity_nothresh == "Asian") %>% pull(beta)) # yes!
+
+mean(long_trainPredictors %>% 
+       filter(Class == "EOPE" & Predicted_ethnicity_nothresh == "Caucasian") %>%
+       pull(beta))
+mean(long_trainPredictors %>% 
+       filter(Class == "Non-PE Preterm" & Predicted_ethnicity_nothresh == "Caucasian") %>%
+       pull(beta))
+round(abs(0.4616887-0.6033051),2) # 0.14
+
+t.test(long_trainPredictors %>% filter(Class == "EOPE" & Predicted_ethnicity_nothresh == "Caucasian") %>% pull(beta), 
+       long_trainPredictors %>% filter(Class == "Non-PE Preterm" & Predicted_ethnicity_nothresh == "Caucasian") %>% pull(beta)) # yes!
+
+mean(long_trainPredictors %>% 
+       filter(Class == "EOPE" & Predicted_ethnicity_nothresh == "African") %>%
+       pull(beta))
+mean(long_trainPredictors %>% 
+       filter(Class == "Non-PE Preterm" & Predicted_ethnicity_nothresh == "African") %>%
+       pull(beta))
+round(abs(0.4792914-0.6160649), 2) # 0.14
+
+t.test(long_trainPredictors %>% filter(Class == "EOPE" & Predicted_ethnicity_nothresh == "African") %>% pull(beta), 
+       long_trainPredictors %>% filter(Class == "Non-PE Preterm" & Predicted_ethnicity_nothresh == "African") %>% pull(beta)) # yes!
+
+# by dataset
+tabyl(trainMeta, GEO_Dataset, Class)
+
+mean(long_trainPredictors %>% 
+       filter(Class == "EOPE" & GEO_Dataset == "GSE100197") %>%
+       pull(beta))
+mean(long_trainPredictors %>% 
+       filter(Class == "Non-PE Preterm" & GEO_Dataset == "GSE100197") %>%
+       pull(beta))
+abs(0.4779409-0.6171722) # 0.14
+
+t.test(long_trainPredictors %>% filter(Class == "EOPE" & GEO_Dataset == "GSE100197") %>% pull(beta), 
+       long_trainPredictors %>% filter(Class == "Non-PE Preterm" & GEO_Dataset == "GSE100197") %>% pull(beta)) # yes!
+
+mean(long_trainPredictors %>% 
+       filter(Class == "EOPE" & GEO_Dataset == "GSE103253") %>%
+       pull(beta))
+mean(long_trainPredictors %>% 
+       filter(Class == "Non-PE Preterm" & GEO_Dataset == "GSE103253") %>%
+       pull(beta))
+abs(0.4658995-0.610967) # 0.14
+
+t.test(long_trainPredictors %>% filter(Class == "EOPE" & GEO_Dataset == "GSE103253") %>% pull(beta), 
+       long_trainPredictors %>% filter(Class == "Non-PE Preterm" & GEO_Dataset == "GSE103253") %>% pull(beta)) # yes!
+
+mean(long_trainPredictors %>% 
+       filter(Class == "EOPE" & GEO_Dataset == "GSE57767") %>%
+       pull(beta))
+mean(long_trainPredictors %>% 
+       filter(Class == "Non-PE Preterm" & GEO_Dataset == "GSE57767") %>%
+       pull(beta))
+abs(0.5143778-0.5862726) # 0.07, way lower
+
+t.test(long_trainPredictors %>% filter(Class == "EOPE" & GEO_Dataset == "GSE57767") %>% pull(beta), 
+       long_trainPredictors %>% filter(Class == "Non-PE Preterm" & GEO_Dataset == "GSE57767") %>% pull(beta)) # yes!
+
+mean(long_trainPredictors %>% 
+       filter(Class == "EOPE" & GEO_Dataset == "GSE73375") %>%
+       pull(beta))
+mean(long_trainPredictors %>% 
+       filter(Class == "Non-PE Preterm" & GEO_Dataset == "GSE73375") %>%
+       pull(beta))
+abs(0.3768132-0.4776764) # 0.10, similar!
+
+t.test(long_trainPredictors %>% filter(Class == "EOPE" & GEO_Dataset == "GSE73375") %>% pull(beta), 
+       long_trainPredictors %>% filter(Class == "Non-PE Preterm" & GEO_Dataset == "GSE73375") %>% pull(beta)) # yes!
+
+```
+
+## Validation 
+
+```{r}
+
+head(long_predictors)
+
+tabyl(valMeta, Class, Predicted_ethnicity_nothresh)
+tabyl(valMeta, Class, Predicted_ethnicity_nothresh, GEO_Dataset)
+
+mean(long_predictors %>% filter(Group == "Validation" & Class == "EOPE") %>% pull(beta))
+mean(long_predictors %>% filter(Group == "Validation" & Class == "Non-PE Preterm") %>% pull(beta))
+round(abs(0.4875962-0.5455664), 2) # 0.06
+
+t.test(long_predictors %>% filter(Group == "Validation" & Class == "EOPE") %>% pull(beta), 
+       long_predictors %>% filter(Group == "Validation" & Class == "Non-PE Preterm") %>% pull(beta)) # yes!
+
+# by ancestry
+mean(long_predictors %>% filter(Group == "Validation" & Class == "EOPE" & Predicted_ethnicity_nothresh == 'Asian') %>% pull(beta))
+mean(long_predictors %>% filter(Group == "Validation" & Class == "Non-PE Preterm" & Predicted_ethnicity_nothresh == 'Asian') %>% pull(beta))
+round(abs(0.5125792-0.5489307), 2) # 0.03
+
+t.test(long_predictors %>% filter(Group == "Validation" & Class == "EOPE" & Predicted_ethnicity_nothresh == 'Asian') %>% pull(beta), 
+       long_predictors %>% filter(Group == "Validation" & Class == "Non-PE Preterm" & Predicted_ethnicity_nothresh == 'Asian') %>% pull(beta)) # yes!
+
+mean(long_predictors %>% filter(Group == "Validation" & Class == "EOPE" & Predicted_ethnicity_nothresh == 'Caucasian') %>% pull(beta))
+mean(long_predictors %>% filter(Group == "Validation" & Class == "Non-PE Preterm" & Predicted_ethnicity_nothresh == 'Caucasian') %>% pull(beta))
+round(abs(0.4268139-0.5448187),2) # 0.12
+
+t.test(long_predictors %>% filter(Group == "Validation" & Class == "EOPE" & Predicted_ethnicity_nothresh == 'Caucasian') %>% pull(beta), 
+       long_predictors %>% filter(Group == "Validation" & Class == "Non-PE Preterm" & Predicted_ethnicity_nothresh == 'Caucasian') %>% pull(beta)) # yes!
+
+# by dataset
+mean(long_predictors %>% filter(Group == "Validation" & Class == "EOPE" & GEO_Dataset == "GSE125605") %>% pull(beta))
+mean(long_predictors %>% filter(Group == "Validation" & Class == "Non-PE Preterm" & GEO_Dataset == 'GSE125605') %>% pull(beta))
+abs(0.5339444-0.5400977) # 0.006
+
+# for comparison, although i cannot run a t-test, the mean B value of the 4 asian samples in GSE98224
+mean(long_predictors %>% filter(Group == "Validation" & Class == "EOPE" & GEO_Dataset == "GSE98224" & Predicted_ethnicity_nothresh == "Asian") %>% pull(beta)) # 0.395
+
+t.test(long_predictors %>% filter(Group == "Validation" & Class == "EOPE" & GEO_Dataset == "GSE125605") %>% pull(beta), 
+       long_predictors %>% filter(Group == "Validation" & Class == "Non-PE Preterm" & GEO_Dataset == "GSE125605") %>% pull(beta)) # not significant, 0.82
+
+mean(long_predictors %>% filter(Group == "Validation" & Class == "EOPE" & GEO_Dataset == "GSE98224") %>% pull(beta))
+mean(long_predictors %>% filter(Group == "Validation" & Class == "Non-PE Preterm" & GEO_Dataset == 'GSE98224') %>% pull(beta))
+abs(0.4238674-0.5617401) # 0.14
+
+t.test(long_predictors %>% filter(Group == "Validation" & Class == "EOPE" & GEO_Dataset == "GSE98224") %>% pull(beta), 
+       long_predictors %>% filter(Group == "Validation" & Class == "Non-PE Preterm" & GEO_Dataset == "GSE98224") %>% pull(beta)) # significant
+
+mean(long_predictors %>% filter(Group == "Validation" & Class == "Non-PE Preterm" & GEO_Dataset == "GSE203396") %>% pull(beta))
+
+```
+
+What is the average beta of term samples in GSE125605?
+
+```{r}
+
+mean(long_predictors %>% filter(GEO_Dataset == "GSE125605" & Class == "Non-PE Term") %>% pull(beta)) # 0.62
+
+```
+
+
+## Cell composition of GSE98224 and GSE125605 by sample
+
+```{r}
+
+meta %>%
+  dplyr::filter(GEO_Dataset %in% c("GSE98224", "GSE125605")) %>%
+  dplyr::filter(Class %in% c('EOPE', 'Non-PE Preterm')) %>%
+  dplyr::select(c(Sample_ID, Trophoblasts, Stromal, Hofbauer,
+                  Endothelial, nRBC, Syncytiotrophoblast,
+                  GEO_Dataset, Class)) %>% 
+  pivot_longer(cols = -c(Sample_ID, GEO_Dataset, Class),
+               names_to = "component",
+               values_to = "estimate") %>%
+  mutate(component = factor(component, levels = c("nRBC", "Endothelial", "Hofbauer",
+                                                  "Stromal", "Trophoblasts",
+                                                  "Syncytiotrophoblast"))) %>%
+  arrange(Sample_ID, component) %>%
+    # plot
+    ggplot(aes(x = reorder(Sample_ID, estimate), y = estimate, fill = component)) +
+    geom_bar(stat = "identity") +
+    scale_fill_manual(values = plColors) +
+    scale_y_continuous(
+        limits = c(-0.1, 1.1), breaks = c(0, 0.5, 1),
+        labels = scales::percent,
+        expand = c(0, 0)) +
+    facet_wrap(Class~GEO_Dataset, scales="free", drop=TRUE) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5),
+          panel.spacing = unit(1.5,'lines')) +
+    coord_cartesian(ylim = c(0, 1)) +
+    labs(x = "", fill = "")
+
+ggsave(here::here("Output", "2022_Manuscript", "FigureSupp_CellComp_GSE98224_GSE100197.png"),
+       width=10, height=10,
+       dpi=200)
+
+```
+
+```{r}
+
+tabyl(meta %>% filter(GEO_Dataset == 'GSE98224'), Class, Predicted_ethnicity_nothresh)
+
+```
+
+
+

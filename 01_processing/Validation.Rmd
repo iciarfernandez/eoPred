@@ -1,0 +1,543 @@
+---
+title: "Processing of Validation Cohort"
+author: "Icíar Fernández Boyano"
+date: "October 26th, 2022 - Re-processed in April 2023"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo 
+editor_options: 
+  chunk_output_type: console
+---
+
+# 1.0 Setup
+
+In this script, I will be processing the data from the validation cohort. While both validation and exploratory cohorts will be used to validate the model, they are processed separately because some leftover samples from the datasets that were included in the training data are in the exploratory cohort, and processing any data from a dataset included in the training (even if they are not the same samples per se) together with an independent cohort may introduce a bias in the data.
+
+**Note:** While working on the paper, I decided to add the TO samples from the vSSRI paper to the validation group. Originally, the validation group had 38 EOPE and 10 "nPTB" samples, but 4 of those 10 nPTB samples actually have FGR too. I think it makes more sense to relabel those samples as FGR and have them in the exploratory group, than having them here and then having to explain how the predictions may actually be correct because even if they are nPTB, they are also FGR. Hence the re-processing to do this. 
+
+```{r}
+
+# PACKAGES
+
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(minfi))
+suppressPackageStartupMessages(library(here))
+suppressPackageStartupMessages(library(janitor))
+suppressPackageStartupMessages(library(tictoc))
+suppressPackageStartupMessages(library(wateRmelon))
+suppressPackageStartupMessages(library(ewastools))
+suppressPackageStartupMessages(library(plomics))
+suppressPackageStartupMessages(library(GEOquery))
+suppressPackageStartupMessages(library(IlluminaHumanMethylation450kanno.ilmn12.hg19))
+suppressPackageStartupMessages(library(IlluminaHumanMethylation450kmanifest))
+
+
+# OBJECTS
+
+here::here() # "Z:/Icíar/Projects/Aim1_PredictPE"
+
+
+# METHYL SET
+mset <- readRDS(here::here("Data", "01_Raw", "complete_mset.rds")) # created in 00_DownloadData.Rmd and 00_MergeGSE120981.Rmd, which are in Code/01_Preprocessing/2020_InitialPreprocessing
+NIHdata <- readRDS("Z:/Amy/Project_NIH_Epiphenotyping/02_Output/00_NIH_Parsing_RedCapSampleSheet/mset_raw.rds")
+NIHmetadata <- read.csv("Z:/Amy/Project_NIH_Epiphenotyping/02_Output/00_NIH_Parsing_RedCapSampleSheet/nih_redcap_204.csv")
+
+dim(mset) # 485512 by 401
+dim(pData(mset)) # 401 by 22
+
+pDat <- as.data.frame(pData(mset))
+  
+all(colnames(mset) == pDat$Sample_ID) # TRUE
+
+# DETECTION P-VALUE
+detp <- readRDS(here("Data", "01_Raw", "detp.rds"))
+
+# SNPs
+snp <- readRDS(here::here("Data", "01_Raw", "snps.rds")) # snps of all datasets
+dim(snp) # 65 by 419
+pDat %>% filter(!Sample_ID %in% colnames(snp)) # yeah, so GSE120981 is not here either
+# figured out that GSE120981 does not have SNP data either unfortunately, and from my previous notes I can see that GSE103253 doesn't either!
+any(is.na(snp)) # TRUE
+
+snp <- snp[,colnames(snp) %in% pDat$Sample_ID] 
+dim(snp) # 65 by 379
+pDat_onlysnp <- pDat %>% filter(!GEO_Dataset %in% c("GSE120981", "GSE103253"))
+dim(pDat_onlysnp) # 297
+
+snp <- snp[,colnames(snp) %in% pDat_onlysnp$Sample_ID] # subset to only those datasets that have SNP data, no point in keeping NAs
+dim(snp) # 65 by 297
+dim(pDat_onlysnp) # 297
+all(colnames(snp) == pDat_onlysnp$Sample_ID) # FALSE
+any(is.na(snp)) # FALSE - all are NAs, good
+
+snp <- snp[,pDat_onlysnp$Sample_ID] # order
+all(colnames(snp) == pDat_onlysnp$Sample_ID) # TRUE
+snps_datasets <- pDat %>%
+  dplyr::filter(Sample_ID %in% colnames(snp))
+table(snps_datasets$GEO_Dataset) 
+
+
+# BEADCOUNT
+bc <- readRDS(here::here("Data", "01_Raw", "beadcount.rds"))
+
+
+# PROBE INFO
+probeInfo <- cbind(IlluminaHumanMethylation450kanno.ilmn12.hg19::Locations,
+                   IlluminaHumanMethylation450kanno.ilmn12.hg19::Manifest,
+                      IlluminaHumanMethylation450kanno.ilmn12.hg19::Other) %>% as.data.frame()
+
+probeInfo <- rownames_to_column(probeInfo, var="probeID")
+
+chrXY <- probeInfo %>% filter(chr %in% c("chrX", "chrY"))
+chrX <- probeInfo %>% filter(chr %in% c("chrX"))
+chrY <- probeInfo %>% filter(chr %in% c("chrY"))
+
+zhouAnno <- readRDS("Z:/Amy/Data/Probe Info (Illumina Manifests)/Zhou/HM450.hg19.manifest.rds") %>% as.data.frame
+
+```
+
+# 2.0 Data & metadata
+
+```{r}
+
+# 1: Set up metadata
+TOMeta <- NIHmetadata %>% filter(str_detect(Record.ID, 'TO'))
+dim(TOMeta) # 64
+
+TOMeta <- TOMeta %>% dplyr::select(Record.ID, 
+                                     Fetal.Sex, Pre.eclampsia,
+                                     IUGR, Gestational.age.at.delivery..weeks.,
+                                     Predicted_ethnicity_nothresh,
+                                     Prob_Asian, Prob_African, Prob_Caucasian, Sentrix,
+                                   Syncytiotrophoblast, Trophoblasts, Stromal, Hofbauer, Endothelial, nRBC) %>% mutate(GEO_Dataset = "GSE203396") %>% mutate(Sample_ID = Record.ID)
+
+dim(TO <- NIHdata[,colnames(NIHdata) %in% c(TOMeta$Sentrix)]) # 64, good
+all(colnames(TO) == TOMeta$Sentrix) # FALSE
+all(colnames(TO) %in% TOMeta$Sentrix) # TRUE
+TOMeta <- TOMeta %>% arrange(factor(Sentrix, levels=colnames(TO)))
+all(colnames(TO) == TOMeta$Sentrix) # TRUE
+colnames(TO) <- TOMeta$Sample_ID
+all(colnames(TO) == TOMeta$Sample_ID) # TRUE
+
+testMeta <- pDat %>% 
+  filter(GEO_Dataset %in% c("GSE125605", "GSE98224")) %>%
+  filter(!Condition == "Replicate") %>%
+  filter(!Condition == "IUGR") %>%
+  mutate(Class = case_when(Condition == "EOPE" ~ "EOPE",
+                           Condition == "PE" & GA_RPC < 34 ~ "EOPE",
+                           Condition == "Non-PE Preterm" ~ "Non-PE Preterm",
+                           PE == "No" & GA_RPC < 37 ~ "Non-PE Preterm")) %>%
+  mutate(Class = replace_na(Class, "Other")) %>%
+  filter(!Class == "Other")
+
+dim(testMeta) # 48 by 23
+testMeta %>% filter(Class == "Non-PE Preterm" & IUGR == "Yes") # remove these 4
+
+testMeta <- testMeta %>% filter(!Sample_ID %in% c("GSM2589559", "GSM2589562", "GSM2589575", "GSM2589577"))
+tabyl(testMeta, Class) # 38 EarlyPE and 6 normotensive (nPTB)
+dim(testMeta) # 44
+
+TOMeta <- TOMeta %>% filter(Gestational.age.at.delivery..weeks. < 37)
+head(TOMeta) # oh well, only 5 samples but at least I gain the nPTB-FGRs I lost with this new classification!
+dim(TO <- TO[,colnames(TO) %in% TOMeta$Record.ID]) # 5
+
+test <- mset[,colnames(mset) %in% testMeta$Sample_ID]
+dim(test) # 485512 by 44
+
+all(colnames(test) == testMeta$Sample_ID) # TRUE
+all(colnames(TO) == TOMeta$Record.ID) # TRUE!
+
+
+
+# 2: Merge data
+dim(val <- combineArrays(test, TO,
+                         outType = c("IlluminaHumanMethylation450k"),
+                         verbose = TRUE)) # 485,512 by 49
+
+
+
+# 3: Merge metadata
+TOMeta <- TOMeta %>% mutate(Class = "Non-PE Preterm",
+                  GA = Gestational.age.at.delivery..weeks.,
+                  Sex = Fetal.Sex,
+                  Sample_ID = Record.ID) %>% dplyr::select(!c(Record.ID, Fetal.Sex, Pre.eclampsia, Gestational.age.at.delivery..weeks., Sentrix))
+
+valMeta <- full_join(testMeta, TOMeta)
+dim(valMeta)
+
+all(colnames(val) == valMeta$Sample_ID) # TRUE, good
+
+```
+
+# 3.0 Normalize
+
+```{r}
+
+saveRDS(val, here("Data", "01_Raw", "valRAW.rds"))
+
+set.seed(2022)
+tic()
+valBMIQ <- wateRmelon::BMIQ(val)
+toc()
+
+saveRDS(valBMIQ, here("Data", "02_Processed", "valBMIQ.rds"))
+
+```
+
+## Add GA RPC for GSE203396 samples
+
+```{r}
+
+library(planet)
+ga <- predictAge(valBMIQ, type="RPC")
+length(ga)
+
+all(colnames(valBMIQ) == valMeta$Sample_ID)
+
+valMeta$GA_RPC <- ga
+
+```
+
+## Characteristics
+
+```{r}
+
+tabyl(valMeta, Class)
+tabyl(valMeta, Class, Sex)
+
+range(as.data.frame(valMeta %>% filter(Class == "EOPE"))$GA_RPC)
+mean(as.data.frame(valMeta %>% filter(Class == "EOPE"))$GA_RPC)
+
+range(as.data.frame(valMeta %>% filter(Class == "Non-PE Preterm"))$GA_RPC)
+mean(as.data.frame(valMeta %>% filter(Class == "Non-PE Preterm"))$GA_RPC)
+
+```
+
+# 4.0 Sample filtering
+
+## 3.1 Intersample correlation
+
+```{r}
+
+all(colnames(valBMIQ) == valMeta$Sample_ID) # TRUE
+
+cor <- cor(na.omit(valBMIQ))
+sample_cor <- apply(cor, 1, mean)
+sample_cor <- data.frame(mean_sample_cor = sample_cor, 
+                         Sample_ID = as.factor(names(sample_cor)))
+head(sample_cor)
+
+all(sample_cor$Sample_ID == valMeta$Sample_ID) # TRUE
+
+valMeta$meanSScor <- sample_cor$mean_sample_cor
+
+ggplot(valMeta, aes(x = Sample_ID, y = meanSScor)) +
+  geom_point(alpha=0.8) +
+  geom_label(data = valMeta %>% filter(meanSScor < 0.95), 
+             aes(label = Sample_ID), vjust = 1.5, col = 'grey') +
+  
+  scale_color_manual(values=c("#117733", "#CC6677")) +
+  scale_y_continuous(limits = c(0.9, 1), breaks = seq(0.9, 1, 0.01)) +
+  
+  theme_classic() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        plot.title = element_text(hjust=0.5)) +
+  labs(x = 'Sample', y = 'Mean correlation', col = 'Platform') +
+  geom_hline(yintercept = 0.95, linetype = 'dashed', color = 'grey') +
+  geom_hline(yintercept = 0.96, linetype = 'dashed', color = 'grey') +
+  geom_hline(yintercept = 0.97, linetype = 'dashed', color = 'grey') +
+  ggtitle("Mean Intersample Correlation - Normalized only")
+
+# 1 samples with <95% intersample correlation, but do a sanity check
+valMeta %>%
+  filter(meanSScor < 0.95) # still 1
+
+valMeta <- 
+  valMeta %>%
+  mutate(FAIL_Intersample_Cor = ifelse(meanSScor < 0.95, TRUE, FALSE))
+
+```
+
+## 3.2 Check sex
+
+Amy wrote the following code to adapt the `ewastools` check sex functions so that they can be used with an mset rather than using the `read_idats` from `ewastools`. 
+
+```{r functions}
+
+mset_check_sex = function(mset){
+  
+  if(!"tidyverse" %in% installed.packages()) {
+    install.packages("tidyverse")
+  }
+  
+  
+  if(!"BiocManager" %in% installed.packages()) {
+    install.packages("BiocManager")
+  }
+  
+  if(!"minfi" %in% installed.packages()) {
+    BiocManager::install("minfi")
+  }
+  
+  require(tidyverse)
+  require(minfi)
+  
+  # define M, U, and probe anno objects
+  M = minfi::getMeth(mset) %>% as.data.frame()
+  U = minfi::getUnmeth(mset) %>% as.data.frame()
+  anno = minfi::getAnnotation(mset) %>% as.data.frame() # annotation with "chr" column, entries chr1 - chrY, probeIDs as rownames
+	
+  
+  # select allosomal probes
+  chrX = dimnames(anno[anno$chr=='chrX',])[[1]]
+  chrY = dimnames(anno[anno$chr=='chrY',])[[1]]
+  
+  # compute the total intensities
+  chrX = colMeans(M[chrX,,drop=FALSE]+U[chrX,,drop=FALSE],na.rm=TRUE)
+  chrY = colMeans(M[chrY,,drop=FALSE]+U[chrY,,drop=FALSE],na.rm=TRUE)
+  
+  # compute the average total intensity across all autosomal probes
+  autosomes = dimnames(anno[!anno$chr %in% c("chrX","chrY"),])[[1]]
+  autosomes = colMeans(M[autosomes,,drop=FALSE]+U[autosomes,,drop=FALSE],na.rm=TRUE)
+  
+  # normalize total intensities
+  chrX_nonorm = chrX
+  chrY_nonorm = chrY
+  
+  chrX = chrX/autosomes
+  chrY = chrY/autosomes
+  
+  # define a df with the output
+  xy_int = data.frame(Sample_ID = dimnames(mset)[[2]],
+                      Array = annotation(mset)[[1]],
+                      X = chrX,
+                      Y = chrY,
+                      X_nonorm = chrX_nonorm,
+                      Y_nonorm = chrY_nonorm)
+  
+	return((xy_int))
+}
+
+mset_predict_sex = function(sex_int,male,female){
+
+	# compute the robust Hodges-Lehmann estimator for the total intensity for X chr probes
+	cutX = outer(sex_int$X[male],sex_int$X[female],"+")
+	cutX = median(cutX)/2
+
+	# ... likewise for Y chr probes
+	cutY = outer(sex_int$Y[male],sex_int$Y[female],"+")
+	cutY = median(cutY)/2
+
+	# Prediction based on in which quadrant (cutX/cutY) samples fall
+	DNAme_Sex = rep(NA,times=length(sex_int$X))
+	DNAme_Sex[sex_int$X>=cutX & sex_int$Y<=cutY] =  "XX"
+	DNAme_Sex[sex_int$X<=cutX & sex_int$Y>=cutY] =  "XY"
+	factor(DNAme_Sex,levels=c("XY","XX"),labels=c("XY","XX"))
+	
+	sex_preds = cbind(sex_int, DNAme_Sex)
+	
+	results = list("Sex_Preds" = sex_preds, "cutX" = cutX, "cutY" = cutY) 
+	
+	return(results)
+}
+
+```
+
+```{r check sex}
+
+dim(val) # 49
+
+pred_sex <- mset_check_sex(val)
+
+male <- valMeta$Sex == "Male"
+female <- valMeta$Sex == "Female"
+
+pred_sex <- mset_predict_sex(pred_sex, male, female)
+pred_sex_df <- pred_sex$Sex_Preds
+
+valMeta <- valMeta %>% left_join(pred_sex_df %>% dplyr::select(Sample_ID, X, Y, DNAme_Sex), by="Sample_ID")
+table(valMeta$Sex, valMeta$DNAme_Sex) # no disagreements
+
+valMeta <- valMeta %>% mutate(FAIL_DNAme_Sex =
+                                    ifelse((Sex == "Male" & DNAme_Sex == "XY") |
+                                   (Sex == "Female" & DNAme_Sex == "XX"), 
+                                 FALSE, TRUE))
+table(valMeta$FAIL_DNAme_Sex) # all false
+
+# all samples look good
+pred_sex_df %>%
+  
+  ggplot(aes(x=X, y=Y, color=DNAme_Sex)) +
+  
+  geom_point() +
+  scale_color_manual(values=c("#997700", "#6699CC") ) +
+  geom_vline(xintercept = pred_sex$cutX) +
+  geom_hline(yintercept = pred_sex$cutY) +
+  
+  labs(title="DNAme-Based Sex",
+       color="Sex",
+       x= "chrX Normalized Total Fluo Intensity",
+       y="chrY Normalized Total Fluo Intensity") +
+  
+  theme_classic() +
+  theme(plot.title = element_text(hjust=0.5))
+
+# no need to remove anything
+
+```
+
+## 3.3 Check identity
+
+```{r}
+
+dim(snp) # 297
+
+valSNP <- snp[,colnames(snp) %in% valMeta$Sample_ID]
+
+dim(valSNP) # 65 by 44
+
+valGenotypes <- call_genotypes(valSNP)
+
+# val
+donors <- colnames(valSNP)
+samples <- colnames(valSNP)
+
+check_snp_agreement(valGenotypes, donor_ids = donors, sample_ids = samples) # 0
+
+```
+
+## 3.4 Minfi sample quality
+
+```{r}
+
+qc <- getQC(val)
+plotQC(qc) # all good
+
+```
+
+# 5.0 Probe filtering
+
+```{r probe filtering - val}
+
+## POOR QUALITY ## 
+val_detp <- detp[,colnames(detp) %in% valMeta$Sample_ID]
+dim(val_detp) # 44
+valMeta_1 <- valMeta %>% filter(Sample_ID %in% colnames(detp))
+
+all(colnames(val_detp) == valMeta_1$Sample_ID) # TRUE
+
+# beadcount
+val_bc <- bc[,colnames(bc) %in% valMeta$Sample_ID]
+dim(val_bc) # 44
+
+all(colnames(val_bc) == valMeta_1$Sample_ID) # TRUE
+
+# after dropping samples, update sex vectors
+female <- valMeta_1$Sex == "Female"
+male <- valMeta_1$Sex == "Male"
+
+sum(female) # 24
+sum(male) # 20
+
+# for female Y chromosome, set detp to 0 (they are not failing so not > 0.05)
+val_detp[rownames(val_detp) %in% chrY$probeID, female] <- 0
+
+dim(val_1 <- valBMIQ[,colnames(valBMIQ) %in% valMeta_1$Sample_ID])
+
+# create a failed probes matrix
+# if detP > 0.01 OR missing value, sum per cell will be > 0
+dim(val_detp <- val_detp[rownames(val_detp) %in% rownames(valBMIQ),])
+dim(val_bc <- val_bc[rownames(val_bc) %in% rownames(valBMIQ),])
+fp <- (val_detp>0.01) + is.na(val_bc) + is.na(val_1)
+fp <- fp > 0
+
+table(rowSums(fp) > ncol(fp)*0.05) # 878 failed probes in > 5% samples
+
+fail_probes <- fp[ rowSums(fp) > ncol(fp)*0.05 ,]
+dim(fail_probes) # 1024
+
+# remove failed probes in > 5% samples
+dim(valBMIQ) # 452453 
+valBMIQ <- valBMIQ[!(rownames(valBMIQ) %in% rownames(fail_probes)),]
+dim(valBMIQ) # 451575
+
+# identify (& remove) samples with > 5% failed probes
+table(colSums(fp) > nrow(fp)*0.05) # zero failing samps, perfect
+
+
+## CROSS-HYBRIDIZING ##
+
+# remove CH and polymorphic with zhou
+zhou_mask <- zhouAnno %>% filter(MASK_general == TRUE)
+dim(zhou_mask) # 60466    
+
+dim(valBMIQ) # 451575      
+table(rownames(valBMIQ) %in% rownames(zhou_mask)) # will lose 56003 in this step
+valBMIQ <- valBMIQ[!(rownames(valBMIQ) %in% rownames(zhou_mask)),]
+dim(valBMIQ) # 395572
+
+# price probes
+## read in files
+Price450K <- read.csv(here::here("Documents", "excel-files", "annotations", "450KMagdaAnnotation.csv"))
+dim(Price450K) # 485512 by 61
+
+# pull ids of cross hyb probes
+Price_CH_XY <- Price450K[grep("YES", Price450K$XY_Hits), ] # probes predicted to cross hybridize to XY , 12388
+Price_CH_Auto <- Price450K[grep("YES", Price450K$Autosomal_Hits), ] # probes predicted to cross hybridize to autosomal sites, 40650
+# how many probes in remaining in filtered project are predicted cross hybridizing by 
+dim(valBMIQ[which((rownames(valBMIQ) %in% Price_CH_XY$IlmnID) | rownames(valBMIQ) %in% Price_CH_Auto$IlmnID), ]) # 8404  probes
+
+# remove XY cross hybridizing 
+
+dim(valBMIQ) # 395572, 48
+valBMIQ <- valBMIQ[!(rownames(valBMIQ) %in% Price_CH_XY$IlmnID), ] 
+dim(valBMIQ) # 394110, 48
+
+# remove autosomal cross hybridizing
+valBMIQ <- valBMIQ[!(rownames(valBMIQ) %in% Price_CH_Auto$IlmnID), ]
+dim(valBMIQ) # 387168, 48
+
+
+## NON-VARIABLE
+
+# function by Rachel Edgar to use on beta valBMIQues
+Variation <- function(x) {quantile(x, c(0.9), na.rm=T)[[1]]-quantile(x, c(0.1), na.rm=T)[[1]]}
+
+# call variability in our data
+ref_range_valBMIQ <- lapply(1:nrow(valBMIQ), function(x) Variation(valBMIQ[x,]))
+
+# how many probes have a variability range less than 0.05 from the 10th to 90th centile in our dataset
+length(which(ref_range_valBMIQ < 0.05))  # 118019
+
+# create new dataset containing these to overlap with Rachel's list
+dim(beta_invariable_valBMIQ <- valBMIQ[which(ref_range_valBMIQ < 0.05),]) # 118019
+
+# now read in database of probes we know to be invariable in many studies, if also invariable in our dataset, remove
+Edgar_Invariable <- read.table(here::here("Documents", "EdgarInvariable.txt"), header = TRUE, sep = ",", dec = ".")
+dim(Edgar_Invariable) # 101367
+head(Edgar_Invariable)
+
+# which of these invariable probes that are in our dataset
+dim(beta_invariable_valBMIQ <- beta_invariable_valBMIQ[which(rownames(beta_invariable_valBMIQ) %in% Edgar_Invariable$CpG), ]) # 76495, 48
+
+# filter to match
+dim(valBMIQ) # 387168, 49
+valBMIQ <- valBMIQ[which(!(rownames(valBMIQ) %in% rownames(beta_invariable_valBMIQ))), ]
+dim(valBMIQ) # 310673, 49
+
+```
+
+# 6.0 Save objects
+
+```{r}
+
+# save objects with XY probes, just remember to remove later
+
+dim(valBMIQ) # 310673 by 49
+saveRDS(valBMIQ, here::here("Data", "02_Processed", "valQC_BMIQ.rds"))
+write.csv(valMeta, here::here("Data", "02_Processed", "valMeta.csv"))
+
+```
